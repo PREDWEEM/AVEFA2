@@ -12,7 +12,7 @@ import plotly.graph_objects as go
 st.set_page_config(page_title="Predicción de Emergencia Agrícola AVEFA", layout="wide")
 
 # ====================== Config pesos ======================
-GITHUB_BASE_URL = "https://raw.githubusercontent.com/PREDWEEM/AVEFA/main"
+GITHUB_BASE_URL = "https://raw.githubusercontent.com/PREDWEEM/AVEFA2/main"
 FNAME_IW   = "IW.npy"
 FNAME_BIW  = "bias_IW.npy"
 FNAME_LW   = "LW.npy"
