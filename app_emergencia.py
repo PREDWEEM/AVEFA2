@@ -47,7 +47,7 @@ def load_npy_from_fixed(filename: str) -> np.ndarray:
     url = f"{GITHUB_BASE_URL}/{filename}"
     raw = _fetch_bytes(url)
     # Más seguro sin pickle
-    return np.load(BytesIO(raw), allow_pickle=False)  # <<< CAMBIO
+    return np.load(BytesIO(raw), allow_pickle=False)
 
 @st.cache_data(ttl=900)
 def load_public_csv():
@@ -74,15 +74,14 @@ def validar_columnas_meteo(df: pd.DataFrame):
 def obtener_colores(niveles: pd.Series):
     return niveles.map(COLOR_MAP).fillna(COLOR_FALLBACK).to_numpy()
 
-# Tomar primeros N días por fecha
-def primeros_dias(df: pd.DataFrame, n: int = 7) -> pd.DataFrame:  # <<< CAMBIO
+# (utilidad que ya no se usa para API automática, pero puede servir en uploads)
+def primeros_dias(df: pd.DataFrame, n: int = 7) -> pd.DataFrame:
     if "Fecha" in df.columns:
         return df.sort_values("Fecha").head(n).reset_index(drop=True)
-    # fallback si no hay "Fecha": ordenar por día juliano
     return df.sort_values("Julian_days").head(n).reset_index(drop=True)
 
 # Sanitizar datos básicos
-def _sanitize_meteo(df: pd.DataFrame) -> pd.DataFrame:  # <<< CAMBIO
+def _sanitize_meteo(df: pd.DataFrame) -> pd.DataFrame:
     cols = ["Julian_days", "TMAX", "TMIN", "Prec"]
     df = df.copy()
     for c in cols:
@@ -105,18 +104,18 @@ class PracticalANNModel:
         self.bias_out = float(bias_out)
         self.input_min = np.array([1, -7, 0, 0], dtype=float)
         self.input_max = np.array([300, 25.5, 41, 84], dtype=float)
-        self._den = np.maximum(self.input_max - self.input_min, 1e-9)  # <<< CAMBIO
+        self._den = np.maximum(self.input_max - self.input_min, 1e-9)
 
     def tansig(self, x): return np.tanh(x)
 
     def normalize_input(self, X):
-        Xc = np.clip(X, self.input_min, self.input_max)  # <<< CAMBIO
-        return 2 * (Xc - self.input_min) / self._den - 1  # <<< CAMBIO
+        Xc = np.clip(X, self.input_min, self.input_max)
+        return 2 * (Xc - self.input_min) / self._den - 1
 
-    def denormalize_output(self, y, ymin=-1, ymax=1):  # <<< CAMBIO (nombre)
+    def denormalize_output(self, y, ymin=-1, ymax=1):
         return (y - ymin) / (ymax - ymin)
 
-    def predict(self, X_real, thr_bajo_medio=THR_BAJO_MEDIO, thr_medio_alto=THR_MEDIO_ALTO):  # <<< CAMBIO (vectorizado)
+    def predict(self, X_real, thr_bajo_medio=THR_BAJO_MEDIO, thr_medio_alto=THR_MEDIO_ALTO):
         Xn = self.normalize_input(X_real)                       # [N,4]
         z1 = Xn @ self.IW + self.bias_IW                        # [N,H]
         a1 = self.tansig(z1)                                    # [N,H]
@@ -152,10 +151,10 @@ except Exception as e:
     st.stop()
 
 try:
-    assert IW.shape[0] == 4, f"IW debe ser [4, H], recibido {IW.shape}"  # <<< CAMBIO
-    assert bias_IW.shape[0] == IW.shape[1], f"bias_IW debe ser [H], recibido {bias_IW.shape}"  # <<< CAMBIO
-    assert LW.shape[1] == IW.shape[1], f"LW debe ser [O, H] con H={IW.shape[1]}, recibido {LW.shape}"  # <<< CAMBIO
-    assert LW.shape[0] == 1, f"Salida esperada 1 neurona, recibido {LW.shape[0]}"  # <<< CAMBIO
+    assert IW.shape[0] == 4, f"IW debe ser [4, H], recibido {IW.shape}"
+    assert bias_IW.shape[0] == IW.shape[1], f"bias_IW debe ser [H], recibido {bias_IW.shape}"
+    assert LW.shape[1] == IW.shape[1], f"LW debe ser [O, H] con H={IW.shape[1]}, recibido {LW.shape}"
+    assert LW.shape[0] == 1, f"Salida esperada 1 neurona, recibido {LW.shape[0]}"
 except AssertionError as e:
     st.error(f"Dimensiones de pesos inconsistentes: {e}")
     st.stop()
@@ -167,11 +166,34 @@ dfs = []
 if fuente_meteo == "Automático (CSV público)":
     try:
         df_auto = load_public_csv()
-        df_auto = _sanitize_meteo(df_auto)  # <<< CAMBIO
-        df_auto_7 = primeros_dias(df_auto, n=7)  # <<< CAMBIO (tomar primeros 7 días)
-        if len(df_auto_7) < 7:
-            st.warning(f"La API entregó solo {len(df_auto_7)} día(s); se usará lo disponible.")
-        dfs.append(("MeteoBahia_CSV (primeros 7 días)", df_auto_7))  # <<< CAMBIO
+        df_auto = _sanitize_meteo(df_auto)
+
+        # ====================== HISTÓRICO + PRIMEROS 7 DÍAS DE PRONÓSTICO ======================
+        # Asegurar columna Fecha
+        if "Fecha" not in df_auto.columns or not np.issubdtype(df_auto["Fecha"].dtype, np.datetime64):
+            year = pd.Timestamp.now().year
+            df_auto["Fecha"] = pd.to_datetime(f"{year}-01-01") + pd.to_timedelta(df_auto["Julian_days"] - 1, unit="D")
+        else:
+            df_auto["Fecha"] = pd.to_datetime(df_auto["Fecha"])
+
+        df_auto = df_auto.sort_values("Fecha").reset_index(drop=True)
+        hoy = pd.Timestamp.now().normalize()
+
+        hist = df_auto.loc[df_auto["Fecha"] <= hoy]
+        fcst = df_auto.loc[df_auto["Fecha"] > hoy].head(7)
+
+        df_auto_sel = pd.concat([hist, fcst], ignore_index=True)
+        df_auto_sel = df_auto_sel.drop_duplicates(subset=["Fecha"]).reset_index(drop=True)
+
+        # Mensajes informativos
+        if fcst.empty:
+            st.warning("La API no trajo días de pronóstico > hoy; se usarán solo datos históricos.")
+        elif len(fcst) < 7:
+            st.info(f"Se incluyeron {len(fcst)} día(s) de pronóstico (menos de 7 disponibles).")
+        else:
+            st.success("Se incluyeron los primeros 7 días del pronóstico además del histórico.")
+
+        dfs.append(("MeteoBahia_CSV (histórico + 7 pronóstico)", df_auto_sel))
     except Exception as e:
         st.error(f"No se pudo leer el CSV público: {e}")
 else:
@@ -187,7 +209,7 @@ else:
             if "Fecha" not in df_up.columns:
                 year = pd.Timestamp.now().year
                 df_up["Fecha"] = pd.to_datetime(f"{year}-01-01") + pd.to_timedelta(df_up["Julian_days"] - 1, unit="D")
-            df_up = _sanitize_meteo(df_up)  # <<< CAMBIO
+            df_up = _sanitize_meteo(df_up)
             dfs.append((Path(f.name).stem, df_up))
     else:
         st.info("Esperando archivo(s) meteo...")
@@ -223,7 +245,7 @@ if dfs:
         m = (pred["Fecha"] >= fi) & (pred["Fecha"] <= ff)
         pred_vis = pred.loc[m].copy()
 
-        # <<< CAMBIO: si no hay datos en 1/feb → 1/nov (p.ej. 1–7 de enero), mostrar el rango real disponible
+        # Fallback a rango real disponible si no hay datos en 1/feb → 1/nov
         rango_personalizado = False
         if pred_vis.empty:
             pred_vis = pred.copy()
@@ -297,7 +319,7 @@ if dfs:
             legend_title="Referencias",
             height=650
         )
-        fig_er.update_xaxes(range=[fi, ff], dtick="D1" if (ff-fi).days <= 31 else "M1", tickformat="%d-%b" if (ff-fi).days <= 31 else "%b")  # <<< CAMBIO (ticks amigables)
+        fig_er.update_xaxes(range=[fi, ff], dtick="D1" if (ff-fi).days <= 31 else "M1", tickformat="%d-%b" if (ff-fi).days <= 31 else "%b")
         fig_er.update_yaxes(rangemode="tozero")
         st.plotly_chart(fig_er, use_container_width=True, theme="streamlit")
 
@@ -358,12 +380,12 @@ if dfs:
             legend_title="Referencias",
             height=600
         )
-        fig.update_xaxes(range=[fi, ff], dtick="D1" if (ff-fi).days <= 31 else "M1", tickformat="%d-%b" if (ff-fi).days <= 31 else "%b")  # <<< CAMBIO
+        fig.update_xaxes(range=[fi, ff], dtick="D1" if (ff-fi).days <= 31 else "M1", tickformat="%d-%b" if (ff-fi).days <= 31 else "%b")
         st.plotly_chart(fig, use_container_width=True, theme="streamlit")
 
         # Texto de rango dinámico
-        rango_txt = f"{fi.date()} → {ff.date()}" if rango_personalizado else "1/feb → 1/nov"  # <<< CAMBIO
-        st.subheader(f"Resultados ({rango_txt}) - {nombre}")  # <<< CAMBIO
+        rango_txt = f"{fi.date()} → {ff.date()}" if rango_personalizado else "1/feb → 1/nov"
+        st.subheader(f"Resultados ({rango_txt}) - {nombre}")
         col_emeac = "EMEAC (%) - ajustable (rango)"
         nivel_icono = {"Bajo": "🟢 Bajo", "Medio": "🟠 Medio", "Alto": "🔴 Alto"}
         tabla = pred_vis[["Fecha","Julian_days","Nivel_Emergencia_relativa",col_emeac]].copy()
@@ -379,4 +401,3 @@ if dfs:
             file_name=f"{nombre}_resultados_rango.csv",
             mime="text/csv"
         )
-
