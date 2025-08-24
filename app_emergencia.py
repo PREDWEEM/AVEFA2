@@ -1,0 +1,382 @@
+# app_emergencia.py
+import streamlit as st
+import numpy as np
+import pandas as pd
+from matplotlib.patches import Patch
+from io import BytesIO, StringIO
+from urllib.request import urlopen, Request
+from urllib.error import HTTPError, URLError
+from pathlib import Path
+import plotly.graph_objects as go
+
+st.set_page_config(page_title="Predicción de Emergencia Agrícola AVEFA", layout="wide")
+
+# ====================== Config pesos ======================
+GITHUB_BASE_URL = "https://raw.githubusercontent.com/PREDWEEM/AVEFA/main"
+FNAME_IW   = "IW.npy"
+FNAME_BIW  = "bias_IW.npy"
+FNAME_LW   = "LW.npy"
+FNAME_BOUT = "bias_out.npy"
+
+# ====================== Umbrales EMERREL ======================
+THR_BAJO_MEDIO = 0.020
+THR_MEDIO_ALTO = 0.079
+
+# ====================== Umbrales EMEAC ======================
+EMEAC_MIN_DEN = 1.8
+EMEAC_ADJ_DEN = 2.1
+EMEAC_MAX_DEN = 2.5
+
+# ====================== Colores por nivel ======================
+COLOR_MAP = {"Bajo": "#2ca02c", "Medio": "#ff7f0e", "Alto": "#d62728"}
+COLOR_FALLBACK = "#808080"
+
+# ====================== Utilidades ======================
+def _fetch_bytes(url: str, timeout: int = 20) -> bytes:
+    try:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except (HTTPError, URLError) as e:
+        raise RuntimeError(f"Error al descargar: {url} · Detalle: {e}")
+    except Exception as e:
+        raise RuntimeError(f"Error al descargar {url}: {e}")
+
+@st.cache_data(ttl=1800)
+def load_npy_from_fixed(filename: str) -> np.ndarray:
+    url = f"{GITHUB_BASE_URL}/{filename}"
+    raw = _fetch_bytes(url)
+    # Más seguro sin pickle
+    return np.load(BytesIO(raw), allow_pickle=False)  # <<< CAMBIO
+
+@st.cache_data(ttl=900)
+def load_public_csv():
+    urls = [
+        "https://PREDWEEM.github.io/ANN/meteo_daily.csv",
+        "https://raw.githubusercontent.com/PREDWEEM/ANN/gh-pages/meteo_daily.csv"
+    ]
+    for url in urls:
+        try:
+            df = pd.read_csv(url, parse_dates=["Fecha"])
+            req = {"Fecha", "Julian_days", "TMAX", "TMIN", "Prec"}
+            if not req.issubset(df.columns):
+                continue
+            return df.sort_values("Fecha").reset_index(drop=True)
+        except Exception:
+            continue
+    raise RuntimeError("No se pudo cargar el CSV público.")
+
+def validar_columnas_meteo(df: pd.DataFrame):
+    req = {"Julian_days", "TMAX", "TMIN", "Prec"}
+    faltan = req - set(df.columns)
+    return (len(faltan) == 0, "" if not faltan else f"Faltan columnas: {', '.join(sorted(faltan))}")
+
+def obtener_colores(niveles: pd.Series):
+    return niveles.map(COLOR_MAP).fillna(COLOR_FALLBACK).to_numpy()
+
+# Tomar primeros N días por fecha
+def primeros_dias(df: pd.DataFrame, n: int = 7) -> pd.DataFrame:  # <<< CAMBIO
+    if "Fecha" in df.columns:
+        return df.sort_values("Fecha").head(n).reset_index(drop=True)
+    # fallback si no hay "Fecha": ordenar por día juliano
+    return df.sort_values("Julian_days").head(n).reset_index(drop=True)
+
+# Sanitizar datos básicos
+def _sanitize_meteo(df: pd.DataFrame) -> pd.DataFrame:  # <<< CAMBIO
+    cols = ["Julian_days", "TMAX", "TMIN", "Prec"]
+    df = df.copy()
+    for c in cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df[cols] = df[cols].interpolate(limit_direction="both")
+    df["Julian_days"] = df["Julian_days"].clip(1, 366)
+    df["Prec"] = df["Prec"].clip(lower=0)
+    # Garantizar TMAX >= TMIN
+    m = df["TMAX"] < df["TMIN"]
+    if m.any():
+        df.loc[m, ["TMAX", "TMIN"]] = df.loc[m, ["TMIN", "TMAX"]].values
+    return df
+
+# ====================== Modelo ======================
+class PracticalANNModel:
+    def __init__(self, IW, bias_IW, LW, bias_out):
+        self.IW = IW
+        self.bias_IW = bias_IW
+        self.LW = LW
+        self.bias_out = float(bias_out)
+        self.input_min = np.array([1, -7, 0, 0], dtype=float)
+        self.input_max = np.array([300, 25.5, 41, 84], dtype=float)
+        self._den = np.maximum(self.input_max - self.input_min, 1e-9)  # <<< CAMBIO
+
+    def tansig(self, x): return np.tanh(x)
+
+    def normalize_input(self, X):
+        Xc = np.clip(X, self.input_min, self.input_max)  # <<< CAMBIO
+        return 2 * (Xc - self.input_min) / self._den - 1  # <<< CAMBIO
+
+    def denormalize_output(self, y, ymin=-1, ymax=1):  # <<< CAMBIO (nombre)
+        return (y - ymin) / (ymax - ymin)
+
+    def predict(self, X_real, thr_bajo_medio=THR_BAJO_MEDIO, thr_medio_alto=THR_MEDIO_ALTO):  # <<< CAMBIO (vectorizado)
+        Xn = self.normalize_input(X_real)                       # [N,4]
+        z1 = Xn @ self.IW + self.bias_IW                        # [N,H]
+        a1 = self.tansig(z1)                                    # [N,H]
+        z2 = (a1 @ self.LW.T).ravel() + self.bias_out           # [N]
+        y  = self.tansig(z2)                                    # [-1,1]
+        y  = self.denormalize_output(y)                         # [0,1]
+
+        ac = np.cumsum(y) / 8.05
+        diff = np.diff(ac, prepend=0)
+
+        niveles = np.where(diff <= thr_bajo_medio, "Bajo",
+                   np.where(diff <= thr_medio_alto, "Medio", "Alto"))
+
+        return pd.DataFrame({"EMERREL(0-1)": diff, "Nivel_Emergencia_relativa": niveles})
+
+# ====================== UI ======================
+st.title("Predicción de Emergencia Agrícola AVEFA")
+
+st.sidebar.header("Meteo")
+fuente_meteo = st.sidebar.radio("Fuente meteo", ["Automático (CSV público)", "Subir Excel meteo"])
+
+if st.sidebar.button("Limpiar caché"):
+    st.cache_data.clear()
+
+# --- Cargar pesos desde GitHub ---
+try:
+    IW       = load_npy_from_fixed(FNAME_IW)
+    bias_IW  = load_npy_from_fixed(FNAME_BIW)
+    LW       = load_npy_from_fixed(FNAME_LW)
+    bias_out = load_npy_from_fixed(FNAME_BOUT).item()
+except Exception as e:
+    st.error(f"No pude cargar los .npy desde GitHub: {e}")
+    st.stop()
+
+try:
+    assert IW.shape[0] == 4, f"IW debe ser [4, H], recibido {IW.shape}"  # <<< CAMBIO
+    assert bias_IW.shape[0] == IW.shape[1], f"bias_IW debe ser [H], recibido {bias_IW.shape}"  # <<< CAMBIO
+    assert LW.shape[1] == IW.shape[1], f"LW debe ser [O, H] con H={IW.shape[1]}, recibido {LW.shape}"  # <<< CAMBIO
+    assert LW.shape[0] == 1, f"Salida esperada 1 neurona, recibido {LW.shape[0]}"  # <<< CAMBIO
+except AssertionError as e:
+    st.error(f"Dimensiones de pesos inconsistentes: {e}")
+    st.stop()
+
+modelo = PracticalANNModel(IW, bias_IW, LW, float(bias_out))
+
+# --- Cargar meteo ---
+dfs = []
+if fuente_meteo == "Automático (CSV público)":
+    try:
+        df_auto = load_public_csv()
+        df_auto = _sanitize_meteo(df_auto)  # <<< CAMBIO
+        df_auto_7 = primeros_dias(df_auto, n=7)  # <<< CAMBIO (tomar primeros 7 días)
+        if len(df_auto_7) < 7:
+            st.warning(f"La API entregó solo {len(df_auto_7)} día(s); se usará lo disponible.")
+        dfs.append(("MeteoBahia_CSV (primeros 7 días)", df_auto_7))  # <<< CAMBIO
+    except Exception as e:
+        st.error(f"No se pudo leer el CSV público: {e}")
+else:
+    ups = st.file_uploader("Subí uno o más .xlsx con columnas: Julian_days, TMAX, TMIN, Prec",
+                           type=["xlsx"], accept_multiple_files=True)
+    if ups:
+        for f in ups:
+            df_up = pd.read_excel(f)
+            ok, msg = validar_columnas_meteo(df_up)
+            if not ok:
+                st.warning(f"{f.name}: {msg}")
+                continue
+            if "Fecha" not in df_up.columns:
+                year = pd.Timestamp.now().year
+                df_up["Fecha"] = pd.to_datetime(f"{year}-01-01") + pd.to_timedelta(df_up["Julian_days"] - 1, unit="D")
+            df_up = _sanitize_meteo(df_up)  # <<< CAMBIO
+            dfs.append((Path(f.name).stem, df_up))
+    else:
+        st.info("Esperando archivo(s) meteo...")
+
+# ====================== Procesamiento y visualización ======================
+if dfs:
+    for nombre, df in dfs:
+        ok, msg = validar_columnas_meteo(df)
+        if not ok:
+            st.warning(f"{nombre}: {msg}")
+            continue
+
+        df = df.sort_values("Julian_days").reset_index(drop=True)
+        X_real = df[["Julian_days", "TMIN", "TMAX", "Prec"]].to_numpy(float)
+        fechas = pd.to_datetime(df["Fecha"])
+
+        pred = modelo.predict(X_real, thr_bajo_medio=THR_BAJO_MEDIO, thr_medio_alto=THR_MEDIO_ALTO)
+        pred["Fecha"] = fechas
+        pred["Julian_days"] = df["Julian_days"]
+        pred["EMERREL acumulado"] = pred["EMERREL(0-1)"].cumsum()
+        pred["EMERREL_MA5"] = pred["EMERREL(0-1)"].rolling(window=5, min_periods=1).mean()
+
+        pred["EMEAC (0-1) - mínimo"]    = pred["EMERREL acumulado"] / EMEAC_MIN_DEN
+        pred["EMEAC (0-1) - máximo"]    = pred["EMERREL acumulado"] / EMEAC_MAX_DEN
+        pred["EMEAC (0-1) - ajustable"] = pred["EMERREL acumulado"] / EMEAC_ADJ_DEN
+        for col in ["EMEAC (0-1) - mínimo", "EMEAC (0-1) - máximo", "EMEAC (0-1) - ajustable"]:
+            pred[col.replace("(0-1)", "(%)")] = (pred[col] * 100).clip(0, 100)
+
+        years = pred["Fecha"].dt.year.unique()
+        yr = int(years[0]) if len(years) == 1 else int(st.sidebar.selectbox("Año (reinicio 1/feb → 1/nov)", sorted(years), key=f"year_select_{nombre}"))
+        fi = pd.Timestamp(year=yr, month=2, day=1)
+        ff = pd.Timestamp(year=yr, month=11, day=1)
+        m = (pred["Fecha"] >= fi) & (pred["Fecha"] <= ff)
+        pred_vis = pred.loc[m].copy()
+
+        # <<< CAMBIO: si no hay datos en 1/feb → 1/nov (p.ej. 1–7 de enero), mostrar el rango real disponible
+        rango_personalizado = False
+        if pred_vis.empty:
+            pred_vis = pred.copy()
+            fi, ff = pred_vis["Fecha"].min(), pred_vis["Fecha"].max()
+            rango_personalizado = True
+            st.info(f"{nombre}: sin datos entre 1/feb y 1/nov; mostrando rango real disponible: {fi.date()} → {ff.date()}.")
+
+        pred_vis["EMERREL acumulado (reiniciado)"] = pred_vis["EMERREL(0-1)"].cumsum()
+        pred_vis["EMEAC (0-1) - mínimo (rango)"]    = pred_vis["EMERREL acumulado (reiniciado)"] / EMEAC_MIN_DEN
+        pred_vis["EMEAC (0-1) - máximo (rango)"]    = pred_vis["EMERREL acumulado (reiniciado)"] / EMEAC_MAX_DEN
+        pred_vis["EMEAC (0-1) - ajustable (rango)"] = pred_vis["EMERREL acumulado (reiniciado)"] / EMEAC_ADJ_DEN
+        for col in ["EMEAC (0-1) - mínimo (rango)", "EMEAC (0-1) - máximo (rango)", "EMEAC (0-1) - ajustable (rango)"]:
+            pred_vis[col.replace("(0-1)", "(%)")] = (pred_vis[col] * 100).clip(0, 100)
+
+        colores_vis = obtener_colores(pred_vis["Nivel_Emergencia_relativa"])
+
+        st.subheader("EMERGENCIA RELATIVA DIARIA")
+        fig_er = go.Figure()
+
+        fig_er.add_bar(
+            x=pred_vis["Fecha"],
+            y=pred_vis["EMERREL(0-1)"],
+            marker=dict(color=colores_vis.tolist()),
+            customdata=pred_vis["Nivel_Emergencia_relativa"].map({"Bajo":"🟢 Bajo","Medio":"🟠 Medio","Alto":"🔴 Alto"}),
+            hovertemplate="Fecha: %{x|%d-%b-%Y}<br>EMERREL: %{y:.3f}<br>Nivel: %{customdata}<extra></extra>",
+            name="EMERREL (0-1)"
+        )
+
+        fig_er.add_trace(go.Scatter(
+            x=pred_vis["Fecha"],
+            y=pred_vis["EMERREL_MA5"],
+            mode="lines",
+            name="Media móvil 5 días",
+            hovertemplate="Fecha: %{x|%d-%b-%Y}<br>MA5: %{y:.3f}<extra></extra>"
+        ))
+
+        fig_er.add_trace(go.Scatter(
+            x=pred_vis["Fecha"],
+            y=pred_vis["EMERREL_MA5"],
+            mode="lines",
+            line=dict(width=0),
+            fill="tozeroy",
+            fillcolor="rgba(135, 206, 250, 0.3)",
+            name="Área MA5",
+            hoverinfo="skip",
+            showlegend=False
+        ))
+
+        low_thr = float(THR_BAJO_MEDIO)
+        med_thr = float(THR_MEDIO_ALTO)
+        fig_er.add_trace(go.Scatter(
+            x=[fi, ff], y=[low_thr, low_thr],
+            mode="lines", line=dict(color=COLOR_MAP["Bajo"], dash="dot"),
+            name=f"Bajo (≤ {low_thr:.3f})", hoverinfo="skip"
+        ))
+        fig_er.add_trace(go.Scatter(
+            x=[fi, ff], y=[med_thr, med_thr],
+            mode="lines", line=dict(color=COLOR_MAP["Medio"], dash="dot"),
+            name=f"Medio (≤ {med_thr:.3f})", hoverinfo="skip"
+        ))
+        fig_er.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            line=dict(color=COLOR_MAP["Alto"], dash="dot"),
+            name=f"Alto (> {med_thr:.3f})", hoverinfo="skip"
+        ))
+
+        fig_er.update_layout(
+            xaxis_title="Fecha",
+            yaxis_title="EMERREL (0-1)",
+            hovermode="x unified",
+            legend_title="Referencias",
+            height=650
+        )
+        fig_er.update_xaxes(range=[fi, ff], dtick="D1" if (ff-fi).days <= 31 else "M1", tickformat="%d-%b" if (ff-fi).days <= 31 else "%b")  # <<< CAMBIO (ticks amigables)
+        fig_er.update_yaxes(rangemode="tozero")
+        st.plotly_chart(fig_er, use_container_width=True, theme="streamlit")
+
+        st.subheader("EMERGENCIA ACUMULADA DIARIA")
+        fig = go.Figure()
+
+        fig.add_trace(go.Scatter(
+            x=pred_vis["Fecha"],
+            y=pred_vis["EMEAC (%) - máximo (rango)"],
+            mode="lines",
+            line=dict(width=0),
+            name="Máximo (reiniciado)",
+            hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Máximo: %{y:.1f}%<extra></extra>"
+        ))
+        fig.add_trace(go.Scatter(
+            x=pred_vis["Fecha"],
+            y=pred_vis["EMEAC (%) - mínimo (rango)"],
+            mode="lines",
+            line=dict(width=0),
+            fill="tonexty",
+            name="Mínimo (reiniciado)",
+            hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Mínimo: %{y:.1f}%<extra></extra>"
+        ))
+
+        fig.add_trace(go.Scatter(
+            x=pred_vis["Fecha"],
+            y=pred_vis["EMEAC (%) - ajustable (rango)"],
+            mode="lines",
+            line=dict(width=2.5),
+            name=f"Umbral ajustable (/{EMEAC_ADJ_DEN:.2f})",
+            hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Ajustable: %{y:.1f}%<extra></extra>"
+        ))
+        fig.add_trace(go.Scatter(
+            x=pred_vis["Fecha"],
+            y=pred_vis["EMEAC (%) - mínimo (rango)"],
+            mode="lines",
+            line=dict(dash="dash", width=1.5),
+            name=f"Umbral mínimo (/{EMEAC_MIN_DEN:.2f})",
+            hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Mínimo: %{y:.1f}%<extra></extra>"
+        ))
+        fig.add_trace(go.Scatter(
+            x=pred_vis["Fecha"],
+            y=pred_vis["EMEAC (%) - máximo (rango)"],
+            mode="lines",
+            line=dict(dash="dash", width=1.5),
+            name=f"Umbral máximo (/{EMEAC_MAX_DEN:.2f})",
+            hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Máximo: %{y:.1f}%<extra></extra>"
+        ))
+
+        for nivel in [25, 50, 75, 90]:
+            fig.add_hline(y=nivel, line_dash="dash", opacity=0.6, annotation_text=f"{nivel}%")
+
+        fig.update_layout(
+            xaxis_title="Fecha",
+            yaxis_title="EMEAC (%)",
+            yaxis=dict(range=[0, 100]),
+            hovermode="x unified",
+            legend_title="Referencias",
+            height=600
+        )
+        fig.update_xaxes(range=[fi, ff], dtick="D1" if (ff-fi).days <= 31 else "M1", tickformat="%d-%b" if (ff-fi).days <= 31 else "%b")  # <<< CAMBIO
+        st.plotly_chart(fig, use_container_width=True, theme="streamlit")
+
+        # Texto de rango dinámico
+        rango_txt = f"{fi.date()} → {ff.date()}" if rango_personalizado else "1/feb → 1/nov"  # <<< CAMBIO
+        st.subheader(f"Resultados ({rango_txt}) - {nombre}")  # <<< CAMBIO
+        col_emeac = "EMEAC (%) - ajustable (rango)"
+        nivel_icono = {"Bajo": "🟢 Bajo", "Medio": "🟠 Medio", "Alto": "🔴 Alto"}
+        tabla = pred_vis[["Fecha","Julian_days","Nivel_Emergencia_relativa",col_emeac]].copy()
+        tabla["Nivel_Emergencia_relativa"] = tabla["Nivel_Emergencia_relativa"].map(nivel_icono)
+        tabla = tabla.rename(columns={"Nivel_Emergencia_relativa":"Nivel de EMERREL", col_emeac:"EMEAC (%)"})
+        st.dataframe(tabla, use_container_width=True)
+
+        csv_buf = StringIO()
+        tabla.to_csv(csv_buf, index=False)
+        st.download_button(
+            f"Descargar resultados (rango) - {nombre}",
+            data=csv_buf.getvalue(),
+            file_name=f"{nombre}_resultados_rango.csv",
+            mime="text/csv"
+        )
+
