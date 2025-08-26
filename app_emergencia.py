@@ -1,4 +1,4 @@
-# app_emergencia.py
+# app_emergencia.py — AVEFA (lockdown + errores genéricos + 7 días de pronóstico)
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -9,7 +9,39 @@ from urllib.error import HTTPError, URLError
 from pathlib import Path
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="Predicción de Emergencia Agrícola AVEFA", layout="wide")
+# =================== LOCKDOWN UI ===================
+st.set_page_config(
+    page_title="Predicción de Emergencia Agrícola AVEFA",
+    layout="wide",
+    menu_items={
+        "Get help": None,
+        "Report a bug": None,
+        "About": None
+    }
+)
+st.markdown(
+    """
+    <style>
+    /* Oculta menú, footer, toolbar y botones de deploy/flags */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header [data-testid="stToolbar"] {visibility: hidden;}
+    .viewerBadge_container__1QSob {visibility: hidden;}
+    .st-emotion-cache-9aoz2h {visibility: hidden;}
+    .stAppDeployButton {display: none;}
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+# =================== Utilidades de error seguro ===================
+from typing import Callable, Any
+def safe_run(fn: Callable[[], Any], user_msg: str):
+    try:
+        return fn()
+    except Exception:
+        st.error(user_msg)
+        return None
 
 # ====================== Config pesos ======================
 GITHUB_BASE_URL = "https://raw.githubusercontent.com/PREDWEEM/AVEFA2/main"
@@ -31,26 +63,28 @@ EMEAC_MAX_DEN = 2.5
 COLOR_MAP = {"Bajo": "#2ca02c", "Medio": "#ff7f0e", "Alto": "#d62728"}
 COLOR_FALLBACK = "#808080"
 
-# ====================== Utilidades ======================
+# ====================== Utilidades de red/archivos ======================
 def _fetch_bytes(url: str, timeout: int = 20) -> bytes:
+    # Evita exponer la URL en errores a la UI
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
-        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urlopen(req, timeout=timeout) as resp:
             return resp.read()
-    except (HTTPError, URLError) as e:
-        raise RuntimeError(f"Error al descargar: {url} · Detalle: {e}")
-    except Exception as e:
-        raise RuntimeError(f"Error al descargar {url}: {e}")
+    except (HTTPError, URLError):
+        raise RuntimeError("No se pudo descargar el recurso remoto.")
+    except Exception:
+        raise RuntimeError("Error descargando recurso remoto.")
 
 @st.cache_data(ttl=1800)
 def load_npy_from_fixed(filename: str) -> np.ndarray:
+    # Sin exponer URL en caso de error
     url = f"{GITHUB_BASE_URL}/{filename}"
     raw = _fetch_bytes(url)
-    # Más seguro sin pickle
     return np.load(BytesIO(raw), allow_pickle=False)
 
 @st.cache_data(ttl=900)
 def load_public_csv():
+    # No exponer URLs en errores; sólo se intenta y devuelve genérico si falla
     urls = [
         "https://PREDWEEM.github.io/ANN/meteo_daily.csv",
         "https://raw.githubusercontent.com/PREDWEEM/ANN/gh-pages/meteo_daily.csv"
@@ -74,7 +108,7 @@ def validar_columnas_meteo(df: pd.DataFrame):
 def obtener_colores(niveles: pd.Series):
     return niveles.map(COLOR_MAP).fillna(COLOR_FALLBACK).to_numpy()
 
-# (utilidad que ya no se usa para API automática, pero puede servir en uploads)
+# (utilidad extra por si se usa con uploads)
 def primeros_dias(df: pd.DataFrame, n: int = 7) -> pd.DataFrame:
     if "Fecha" in df.columns:
         return df.sort_values("Fecha").head(n).reset_index(drop=True)
@@ -102,6 +136,7 @@ class PracticalANNModel:
         self.bias_IW = bias_IW
         self.LW = LW
         self.bias_out = float(bias_out)
+        # Orden esperado en X_real: [Julian_days, TMIN, TMAX, Prec]
         self.input_min = np.array([1, -7, 0, 0], dtype=float)
         self.input_max = np.array([300, 25.5, 41, 84], dtype=float)
         self._den = np.maximum(self.input_max - self.input_min, 1e-9)
@@ -140,36 +175,34 @@ fuente_meteo = st.sidebar.radio("Fuente meteo", ["Automático (CSV público)", "
 if st.sidebar.button("Limpiar caché"):
     st.cache_data.clear()
 
-# --- Cargar pesos desde GitHub ---
-try:
+# --- Cargar pesos (con mensajes genéricos) ---
+def _cargar_pesos():
     IW       = load_npy_from_fixed(FNAME_IW)
     bias_IW  = load_npy_from_fixed(FNAME_BIW)
     LW       = load_npy_from_fixed(FNAME_LW)
     bias_out = load_npy_from_fixed(FNAME_BOUT).item()
-except Exception as e:
-    st.error(f"No pude cargar los .npy desde GitHub: {e}")
-    st.stop()
+    # Validaciones mínimas (no exponen rutas/URLs)
+    assert IW.shape[0] == 4, "Dimensiones de pesos inválidas."
+    assert bias_IW.shape[0] == IW.shape[1], "Dimensiones de pesos inválidas."
+    assert LW.shape[1] == IW.shape[1] and LW.shape[0] == 1, "Dimensiones de pesos inválidas."
+    return IW, bias_IW, LW, bias_out
 
-try:
-    assert IW.shape[0] == 4, f"IW debe ser [4, H], recibido {IW.shape}"
-    assert bias_IW.shape[0] == IW.shape[1], f"bias_IW debe ser [H], recibido {bias_IW.shape}"
-    assert LW.shape[1] == IW.shape[1], f"LW debe ser [O, H] con H={IW.shape[1]}, recibido {LW.shape}"
-    assert LW.shape[0] == 1, f"Salida esperada 1 neurona, recibido {LW.shape[0]}"
-except AssertionError as e:
-    st.error(f"Dimensiones de pesos inconsistentes: {e}")
+pesos = safe_run(_cargar_pesos, "No se pudieron cargar los archivos del modelo.")
+if pesos is None:
     st.stop()
-
+IW, bias_IW, LW, bias_out = pesos
 modelo = PracticalANNModel(IW, bias_IW, LW, float(bias_out))
 
 # --- Cargar meteo ---
 dfs = []
 if fuente_meteo == "Automático (CSV público)":
-    try:
-        df_auto = load_public_csv()
-        df_auto = _sanitize_meteo(df_auto)
+    def _leer_public_csv():
+        df = load_public_csv()
+        return _sanitize_meteo(df)
 
+    df_auto = safe_run(_leer_public_csv, "No se pudo leer la fuente meteorológica.")
+    if df_auto is not None:
         # ====================== HISTÓRICO + PRIMEROS 7 DÍAS DE PRONÓSTICO ======================
-        # Asegurar columna Fecha
         if "Fecha" not in df_auto.columns or not np.issubdtype(df_auto["Fecha"].dtype, np.datetime64):
             year = pd.Timestamp.now().year
             df_auto["Fecha"] = pd.to_datetime(f"{year}-01-01") + pd.to_timedelta(df_auto["Julian_days"] - 1, unit="D")
@@ -185,23 +218,22 @@ if fuente_meteo == "Automático (CSV público)":
         df_auto_sel = pd.concat([hist, fcst], ignore_index=True)
         df_auto_sel = df_auto_sel.drop_duplicates(subset=["Fecha"]).reset_index(drop=True)
 
-        # Mensajes informativos
         if fcst.empty:
-            st.warning("La API no trajo días de pronóstico > hoy; se usarán solo datos históricos.")
+            st.warning("No hay días de pronóstico posteriores a hoy; se usan solo datos históricos.")
         elif len(fcst) < 7:
             st.info(f"Se incluyeron {len(fcst)} día(s) de pronóstico (menos de 7 disponibles).")
-        else:
-            st.success("Se incluyeron los primeros 7 días del pronóstico además del histórico.")
 
-        dfs.append(("MeteoBahia_CSV (histórico + 7 pronóstico)", df_auto_sel))
-    except Exception as e:
-        st.error(f"No se pudo leer el CSV público: {e}")
+        dfs.append(("Meteo (histórico + 7 pronóstico)", df_auto_sel))
 else:
     ups = st.file_uploader("Subí uno o más .xlsx con columnas: Julian_days, TMAX, TMIN, Prec",
                            type=["xlsx"], accept_multiple_files=True)
     if ups:
         for f in ups:
-            df_up = pd.read_excel(f)
+            def _leer_xlsx():
+                return pd.read_excel(f)
+            df_up = safe_run(_leer_xlsx, "No se pudo leer el archivo subido.")
+            if df_up is None:
+                continue
             ok, msg = validar_columnas_meteo(df_up)
             if not ok:
                 st.warning(f"{f.name}: {msg}")
@@ -223,6 +255,7 @@ if dfs:
             continue
 
         df = df.sort_values("Julian_days").reset_index(drop=True)
+        # Orden esperado por el modelo: [Julian_days, TMIN, TMAX, Prec]
         X_real = df[["Julian_days", "TMIN", "TMAX", "Prec"]].to_numpy(float)
         fechas = pd.to_datetime(df["Fecha"])
 
@@ -264,7 +297,6 @@ if dfs:
 
         st.subheader("EMERGENCIA RELATIVA DIARIA")
         fig_er = go.Figure()
-
         fig_er.add_bar(
             x=pred_vis["Fecha"],
             y=pred_vis["EMERREL(0-1)"],
@@ -273,114 +305,75 @@ if dfs:
             hovertemplate="Fecha: %{x|%d-%b-%Y}<br>EMERREL: %{y:.3f}<br>Nivel: %{customdata}<extra></extra>",
             name="EMERREL (0-1)"
         )
-
         fig_er.add_trace(go.Scatter(
-            x=pred_vis["Fecha"],
-            y=pred_vis["EMERREL_MA5"],
-            mode="lines",
-            name="Media móvil 5 días",
+            x=pred_vis["Fecha"], y=pred_vis["EMERREL_MA5"],
+            mode="lines", name="Media móvil 5 días",
             hovertemplate="Fecha: %{x|%d-%b-%Y}<br>MA5: %{y:.3f}<extra></extra>"
         ))
-
         fig_er.add_trace(go.Scatter(
-            x=pred_vis["Fecha"],
-            y=pred_vis["EMERREL_MA5"],
-            mode="lines",
-            line=dict(width=0),
-            fill="tozeroy",
-            fillcolor="rgba(135, 206, 250, 0.3)",
-            name="Área MA5",
-            hoverinfo="skip",
-            showlegend=False
+            x=pred_vis["Fecha"], y=pred_vis["EMERREL_MA5"],
+            mode="lines", line=dict(width=0), fill="tozeroy",
+            fillcolor="rgba(135, 206, 250, 0.3)", name="Área MA5",
+            hoverinfo="skip", showlegend=False
         ))
-
-        low_thr = float(THR_BAJO_MEDIO)
-        med_thr = float(THR_MEDIO_ALTO)
-        fig_er.add_trace(go.Scatter(
-            x=[fi, ff], y=[low_thr, low_thr],
+        low_thr = float(THR_BAJO_MEDIO); med_thr = float(THR_MEDIO_ALTO)
+        fig_er.add_trace(go.Scatter(x=[fi, ff], y=[low_thr, low_thr],
             mode="lines", line=dict(color=COLOR_MAP["Bajo"], dash="dot"),
-            name=f"Bajo (≤ {low_thr:.3f})", hoverinfo="skip"
-        ))
-        fig_er.add_trace(go.Scatter(
-            x=[fi, ff], y=[med_thr, med_thr],
+            name=f"Bajo (≤ {low_thr:.3f})", hoverinfo="skip"))
+        fig_er.add_trace(go.Scatter(x=[fi, ff], y=[med_thr, med_thr],
             mode="lines", line=dict(color=COLOR_MAP["Medio"], dash="dot"),
-            name=f"Medio (≤ {med_thr:.3f})", hoverinfo="skip"
-        ))
-        fig_er.add_trace(go.Scatter(
-            x=[None], y=[None], mode="lines",
+            name=f"Medio (≤ {med_thr:.3f})", hoverinfo="skip"))
+        fig_er.add_trace(go.Scatter(x=[None], y=[None], mode="lines",
             line=dict(color=COLOR_MAP["Alto"], dash="dot"),
-            name=f"Alto (> {med_thr:.3f})", hoverinfo="skip"
-        ))
-
+            name=f"Alto (> {med_thr:.3f})", hoverinfo="skip"))
         fig_er.update_layout(
-            xaxis_title="Fecha",
-            yaxis_title="EMERREL (0-1)",
-            hovermode="x unified",
-            legend_title="Referencias",
-            height=650
+            xaxis_title="Fecha", yaxis_title="EMERREL (0-1)",
+            hovermode="x unified", legend_title="Referencias", height=650
         )
-        fig_er.update_xaxes(range=[fi, ff], dtick="D1" if (ff-fi).days <= 31 else "M1", tickformat="%d-%b" if (ff-fi).days <= 31 else "%b")
+        fig_er.update_xaxes(range=[fi, ff], dtick="D1" if (ff-fi).days <= 31 else "M1",
+                            tickformat="%d-%b" if (ff-fi).days <= 31 else "%b")
         fig_er.update_yaxes(rangemode="tozero")
         st.plotly_chart(fig_er, use_container_width=True, theme="streamlit")
 
         st.subheader("EMERGENCIA ACUMULADA DIARIA")
         fig = go.Figure()
-
         fig.add_trace(go.Scatter(
-            x=pred_vis["Fecha"],
-            y=pred_vis["EMEAC (%) - máximo (rango)"],
-            mode="lines",
-            line=dict(width=0),
-            name="Máximo (reiniciado)",
+            x=pred_vis["Fecha"], y=pred_vis["EMEAC (%) - máximo (rango)"],
+            mode="lines", line=dict(width=0), name="Máximo (reiniciado)",
             hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Máximo: %{y:.1f}%<extra></extra>"
         ))
         fig.add_trace(go.Scatter(
-            x=pred_vis["Fecha"],
-            y=pred_vis["EMEAC (%) - mínimo (rango)"],
-            mode="lines",
-            line=dict(width=0),
-            fill="tonexty",
-            name="Mínimo (reiniciado)",
+            x=pred_vis["Fecha"], y=pred_vis["EMEAC (%) - mínimo (rango)"],
+            mode="lines", line=dict(width=0), fill="tonexty", name="Mínimo (reiniciado)",
             hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Mínimo: %{y:.1f}%<extra></extra>"
         ))
-
         fig.add_trace(go.Scatter(
-            x=pred_vis["Fecha"],
-            y=pred_vis["EMEAC (%) - ajustable (rango)"],
-            mode="lines",
-            line=dict(width=2.5),
+            x=pred_vis["Fecha"], y=pred_vis["EMEAC (%) - ajustable (rango)"],
+            mode="lines", line=dict(width=2.5),
             name=f"Umbral ajustable (/{EMEAC_ADJ_DEN:.2f})",
             hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Ajustable: %{y:.1f}%<extra></extra>"
         ))
         fig.add_trace(go.Scatter(
-            x=pred_vis["Fecha"],
-            y=pred_vis["EMEAC (%) - mínimo (rango)"],
-            mode="lines",
-            line=dict(dash="dash", width=1.5),
+            x=pred_vis["Fecha"], y=pred_vis["EMEAC (%) - mínimo (rango)"],
+            mode="lines", line=dict(dash="dash", width=1.5),
             name=f"Umbral mínimo (/{EMEAC_MIN_DEN:.2f})",
             hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Mínimo: %{y:.1f}%<extra></extra>"
         ))
         fig.add_trace(go.Scatter(
-            x=pred_vis["Fecha"],
-            y=pred_vis["EMEAC (%) - máximo (rango)"],
-            mode="lines",
-            line=dict(dash="dash", width=1.5),
+            x=pred_vis["Fecha"], y=pred_vis["EMEAC (%) - máximo (rango)"],
+            mode="lines", line=dict(dash="dash", width=1.5),
             name=f"Umbral máximo (/{EMEAC_MAX_DEN:.2f})",
             hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Máximo: %{y:.1f}%<extra></extra>"
         ))
-
         for nivel in [25, 50, 75, 90]:
             fig.add_hline(y=nivel, line_dash="dash", opacity=0.6, annotation_text=f"{nivel}%")
-
         fig.update_layout(
-            xaxis_title="Fecha",
-            yaxis_title="EMEAC (%)",
-            yaxis=dict(range=[0, 100]),
-            hovermode="x unified",
-            legend_title="Referencias",
-            height=600
+            xaxis_title="Fecha", yaxis_title="EMEAC (%)",
+            yaxis=dict(range=[0, 100]), hovermode="x unified",
+            legend_title="Referencias", height=600
         )
-        fig.update_xaxes(range=[fi, ff], dtick="D1" if (ff-fi).days <= 31 else "M1", tickformat="%d-%b" if (ff-fi).days <= 31 else "%b")
+        fig.update_xaxes(range=[fi, ff], dtick="D1" if (ff-fi).days <= 31 else "M1",
+                         tickformat="%d-%b" if (ff-fi).days <= 31 else "%b")
         st.plotly_chart(fig, use_container_width=True, theme="streamlit")
 
         # Texto de rango dinámico
@@ -401,3 +394,4 @@ if dfs:
             file_name=f"{nombre}_resultados_rango.csv",
             mime="text/csv"
         )
+
