@@ -1,4 +1,4 @@
-# app_emergencia.py — AVEFA (lockdown + errores genéricos + PRONÓSTICO COMPLETO)
+# app_emergencia.py — AVEFA (lockdown + pronóstico completo + MA5 sombreada + sin tabla de pronóstico completo)
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -119,6 +119,7 @@ class PracticalANNModel:
         self.bias_IW = bias_IW
         self.LW = LW
         self.bias_out = float(bias_out)
+        # Orden esperado: [Julian_days, TMIN, TMAX, Prec]
         self.input_min = np.array([1, -7, 0, 0], dtype=float)
         self.input_max = np.array([300, 25.5, 41, 84], dtype=float)
         self._den = np.maximum(self.input_max - self.input_min, 1e-9)
@@ -177,6 +178,7 @@ if fuente_meteo == "Automático (CSV público)":
         return _sanitize_meteo(df)
     df_auto = safe_run(_leer_public_csv, "No se pudo leer la fuente meteorológica.")
     if df_auto is not None:
+        # Asegurar fecha
         if "Fecha" not in df_auto.columns or not np.issubdtype(df_auto["Fecha"].dtype, np.datetime64):
             year = pd.Timestamp.now().year
             df_auto["Fecha"] = pd.to_datetime(f"{year}-01-01") + pd.to_timedelta(df_auto["Julian_days"] - 1, unit="D")
@@ -185,10 +187,9 @@ if fuente_meteo == "Automático (CSV público)":
         df_auto = df_auto.sort_values("Fecha").reset_index(drop=True)
 
         hoy = pd.Timestamp.now().normalize()
-
         # =========== HISTÓRICO + PRONÓSTICO COMPLETO (sin recorte) ===========
         hist = df_auto.loc[df_auto["Fecha"] <= hoy]
-        fcst = df_auto.loc[df_auto["Fecha"] >  hoy]    # <<-- SIN .head(7), toma todo el pronóstico disponible
+        fcst = df_auto.loc[df_auto["Fecha"] >  hoy]   # <-- sin .head(7)
         if fcst.empty:
             st.warning("No hay días de pronóstico posteriores a hoy; se usan solo datos históricos.")
         else:
@@ -265,36 +266,34 @@ if dfs:
 
         colores_vis = obtener_colores(pred_vis["Nivel_Emergencia_relativa"])
 
-      # ====== FIGURA: EMERREL diario ======
-st.subheader("EMERGENCIA RELATIVA DIARIA")
-fig_er = go.Figure()
-fig_er.add_bar(
-    x=pred_vis["Fecha"],
-    y=pred_vis["EMERREL(0-1)"],
-    marker=dict(color=colores_vis.tolist()),
-    customdata=pred_vis["Nivel_Emergencia_relativa"].map(
-        {"Bajo": "🟢 Bajo", "Medio": "🟠 Medio", "Alto": "🔴 Alto"}
-    ),
-    hovertemplate="Fecha: %{x|%d-%b-%Y}<br>EMERREL: %{y:.3f}<br>Nivel: %{customdata}<extra></extra>",
-    name="EMERREL (0-1)"
-)
-
-# Línea MA5
-fig_er.add_trace(go.Scatter(
-    x=pred_vis["Fecha"], y=pred_vis["EMERREL_MA5"],
-    mode="lines", line=dict(color="royalblue", width=2),
-    name="Media móvil 5 días",
-    hovertemplate="Fecha: %{x|%d-%b-%Y}<br>MA5: %{y:.3f}<extra></extra>"
-))
-
-# 🌟 Sombreado tenue bajo la línea MA5
-fig_er.add_trace(go.Scatter(
-    x=pred_vis["Fecha"], y=pred_vis["EMERREL_MA5"],
-    mode="lines", line=dict(width=0),
-    fill="tozeroy", fillcolor="rgba(65,105,225,0.15)",  # azul tenue
-    hoverinfo="skip", showlegend=False
-))
-
+        # ====== FIGURA: EMERREL diario (con MA5 sombreada) ======
+        st.subheader("EMERGENCIA RELATIVA DIARIA")
+        fig_er = go.Figure()
+        fig_er.add_bar(
+            x=pred_vis["Fecha"],
+            y=pred_vis["EMERREL(0-1)"],
+            marker=dict(color=colores_vis.tolist()),
+            customdata=pred_vis["Nivel_Emergencia_relativa"].map(
+                {"Bajo": "🟢 Bajo", "Medio": "🟠 Medio", "Alto": "🔴 Alto"}
+            ),
+            hovertemplate="Fecha: %{x|%d-%b-%Y}<br>EMERREL: %{y:.3f}<br>Nivel: %{customdata}<extra></extra>",
+            name="EMERREL (0-1)"
+        )
+        # Línea MA5
+        fig_er.add_trace(go.Scatter(
+            x=pred_vis["Fecha"], y=pred_vis["EMERREL_MA5"],
+            mode="lines", line=dict(width=2),
+            name="Media móvil 5 días",
+            hovertemplate="Fecha: %{x|%d-%b-%Y}<br>MA5: %{y:.3f}<extra></extra>"
+        ))
+        # Sombreado tenue bajo MA5
+        fig_er.add_trace(go.Scatter(
+            x=pred_vis["Fecha"], y=pred_vis["EMERREL_MA5"],
+            mode="lines", line=dict(width=0),
+            fill="tozeroy", fillcolor="rgba(65,105,225,0.15)",
+            hoverinfo="skip", showlegend=False
+        ))
+        # Niveles de referencia
         low_thr = float(THR_BAJO_MEDIO); med_thr = float(THR_MEDIO_ALTO)
         fig_er.add_trace(go.Scatter(x=[fi, ff], y=[low_thr, low_thr],
             mode="lines", line=dict(color=COLOR_MAP["Bajo"], dash="dot"),
@@ -374,4 +373,3 @@ fig_er.add_trace(go.Scatter(
             mime="text/csv"
         )
 
-       
