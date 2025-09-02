@@ -1,8 +1,7 @@
-# app_emergencia.py — AVEFA (lockdown + errores genéricos + 7 días de pronóstico)
+# app_emergencia.py — AVEFA (lockdown + errores genéricos + PRONÓSTICO COMPLETO)
 import streamlit as st
 import numpy as np
 import pandas as pd
-from matplotlib.patches import Patch
 from io import BytesIO, StringIO
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
@@ -13,16 +12,11 @@ import plotly.graph_objects as go
 st.set_page_config(
     page_title="Predicción de Emergencia Agrícola AVEFA",
     layout="wide",
-    menu_items={
-        "Get help": None,
-        "Report a bug": None,
-        "About": None
-    }
+    menu_items={"Get help": None, "Report a bug": None, "About": None}
 )
 st.markdown(
     """
     <style>
-    /* Oculta menú, footer, toolbar y botones de deploy/flags */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header [data-testid="stToolbar"] {visibility: hidden;}
@@ -65,7 +59,6 @@ COLOR_FALLBACK = "#808080"
 
 # ====================== Utilidades de red/archivos ======================
 def _fetch_bytes(url: str, timeout: int = 20) -> bytes:
-    # Evita exponer la URL en errores a la UI
     req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
         with urlopen(req, timeout=timeout) as resp:
@@ -77,14 +70,12 @@ def _fetch_bytes(url: str, timeout: int = 20) -> bytes:
 
 @st.cache_data(ttl=1800)
 def load_npy_from_fixed(filename: str) -> np.ndarray:
-    # Sin exponer URL en caso de error
     url = f"{GITHUB_BASE_URL}/{filename}"
     raw = _fetch_bytes(url)
     return np.load(BytesIO(raw), allow_pickle=False)
 
 @st.cache_data(ttl=900)
 def load_public_csv():
-    # No exponer URLs en errores; sólo se intenta y devuelve genérico si falla
     urls = [
         "https://PREDWEEM.github.io/ANN/meteo_daily.csv",
         "https://raw.githubusercontent.com/PREDWEEM/ANN/gh-pages/meteo_daily.csv"
@@ -108,13 +99,6 @@ def validar_columnas_meteo(df: pd.DataFrame):
 def obtener_colores(niveles: pd.Series):
     return niveles.map(COLOR_MAP).fillna(COLOR_FALLBACK).to_numpy()
 
-# (utilidad extra por si se usa con uploads)
-def primeros_dias(df: pd.DataFrame, n: int = 7) -> pd.DataFrame:
-    if "Fecha" in df.columns:
-        return df.sort_values("Fecha").head(n).reset_index(drop=True)
-    return df.sort_values("Julian_days").head(n).reset_index(drop=True)
-
-# Sanitizar datos básicos
 def _sanitize_meteo(df: pd.DataFrame) -> pd.DataFrame:
     cols = ["Julian_days", "TMAX", "TMIN", "Prec"]
     df = df.copy()
@@ -123,7 +107,6 @@ def _sanitize_meteo(df: pd.DataFrame) -> pd.DataFrame:
     df[cols] = df[cols].interpolate(limit_direction="both")
     df["Julian_days"] = df["Julian_days"].clip(1, 366)
     df["Prec"] = df["Prec"].clip(lower=0)
-    # Garantizar TMAX >= TMIN
     m = df["TMAX"] < df["TMIN"]
     if m.any():
         df.loc[m, ["TMAX", "TMIN"]] = df.loc[m, ["TMIN", "TMAX"]].values
@@ -136,34 +119,28 @@ class PracticalANNModel:
         self.bias_IW = bias_IW
         self.LW = LW
         self.bias_out = float(bias_out)
-        # Orden esperado en X_real: [Julian_days, TMIN, TMAX, Prec]
         self.input_min = np.array([1, -7, 0, 0], dtype=float)
         self.input_max = np.array([300, 25.5, 41, 84], dtype=float)
         self._den = np.maximum(self.input_max - self.input_min, 1e-9)
 
     def tansig(self, x): return np.tanh(x)
-
     def normalize_input(self, X):
         Xc = np.clip(X, self.input_min, self.input_max)
         return 2 * (Xc - self.input_min) / self._den - 1
-
     def denormalize_output(self, y, ymin=-1, ymax=1):
         return (y - ymin) / (ymax - ymin)
 
     def predict(self, X_real, thr_bajo_medio=THR_BAJO_MEDIO, thr_medio_alto=THR_MEDIO_ALTO):
-        Xn = self.normalize_input(X_real)                       # [N,4]
-        z1 = Xn @ self.IW + self.bias_IW                        # [N,H]
-        a1 = self.tansig(z1)                                    # [N,H]
-        z2 = (a1 @ self.LW.T).ravel() + self.bias_out           # [N]
-        y  = self.tansig(z2)                                    # [-1,1]
-        y  = self.denormalize_output(y)                         # [0,1]
-
+        Xn = self.normalize_input(X_real)
+        z1 = Xn @ self.IW + self.bias_IW
+        a1 = self.tansig(z1)
+        z2 = (a1 @ self.LW.T).ravel() + self.bias_out
+        y  = self.tansig(z2)
+        y  = self.denormalize_output(y)   # [0,1]
         ac = np.cumsum(y) / 8.05
         diff = np.diff(ac, prepend=0)
-
         niveles = np.where(diff <= thr_bajo_medio, "Bajo",
                    np.where(diff <= thr_medio_alto, "Medio", "Alto"))
-
         return pd.DataFrame({"EMERREL(0-1)": diff, "Nivel_Emergencia_relativa": niveles})
 
 # ====================== UI ======================
@@ -175,13 +152,12 @@ fuente_meteo = st.sidebar.radio("Fuente meteo", ["Automático (CSV público)", "
 if st.sidebar.button("Limpiar caché"):
     st.cache_data.clear()
 
-# --- Cargar pesos (con mensajes genéricos) ---
+# --- Cargar pesos ---
 def _cargar_pesos():
     IW       = load_npy_from_fixed(FNAME_IW)
     bias_IW  = load_npy_from_fixed(FNAME_BIW)
     LW       = load_npy_from_fixed(FNAME_LW)
     bias_out = load_npy_from_fixed(FNAME_BOUT).item()
-    # Validaciones mínimas (no exponen rutas/URLs)
     assert IW.shape[0] == 4, "Dimensiones de pesos inválidas."
     assert bias_IW.shape[0] == IW.shape[1], "Dimensiones de pesos inválidas."
     assert LW.shape[1] == IW.shape[1] and LW.shape[0] == 1, "Dimensiones de pesos inválidas."
@@ -199,31 +175,26 @@ if fuente_meteo == "Automático (CSV público)":
     def _leer_public_csv():
         df = load_public_csv()
         return _sanitize_meteo(df)
-
     df_auto = safe_run(_leer_public_csv, "No se pudo leer la fuente meteorológica.")
     if df_auto is not None:
-        # ====================== HISTÓRICO + PRIMEROS 7 DÍAS DE PRONÓSTICO ======================
         if "Fecha" not in df_auto.columns or not np.issubdtype(df_auto["Fecha"].dtype, np.datetime64):
             year = pd.Timestamp.now().year
             df_auto["Fecha"] = pd.to_datetime(f"{year}-01-01") + pd.to_timedelta(df_auto["Julian_days"] - 1, unit="D")
         else:
             df_auto["Fecha"] = pd.to_datetime(df_auto["Fecha"])
-
         df_auto = df_auto.sort_values("Fecha").reset_index(drop=True)
+
         hoy = pd.Timestamp.now().normalize()
 
+        # =========== HISTÓRICO + PRONÓSTICO COMPLETO (sin recorte) ===========
         hist = df_auto.loc[df_auto["Fecha"] <= hoy]
-        fcst = df_auto.loc[df_auto["Fecha"] > hoy].head(7)
-
-        df_auto_sel = pd.concat([hist, fcst], ignore_index=True)
-        df_auto_sel = df_auto_sel.drop_duplicates(subset=["Fecha"]).reset_index(drop=True)
-
+        fcst = df_auto.loc[df_auto["Fecha"] >  hoy]    # <<-- SIN .head(7), toma todo el pronóstico disponible
         if fcst.empty:
             st.warning("No hay días de pronóstico posteriores a hoy; se usan solo datos históricos.")
-        elif len(fcst) < 7:
-            st.info(f"Se incluyeron {len(fcst)} día(s) de pronóstico (menos de 7 disponibles).")
-
-        dfs.append(("Meteo (histórico + 7 pronóstico)", df_auto_sel))
+        else:
+            st.success(f"Pronóstico completo detectado: {len(fcst)} día(s) futuros incluidos.")
+        df_auto_sel = pd.concat([hist, fcst], ignore_index=True).drop_duplicates(subset=["Fecha"])
+        dfs.append(("Meteo (histórico + pronóstico completo)", df_auto_sel))
 else:
     ups = st.file_uploader("Subí uno o más .xlsx con columnas: Julian_days, TMAX, TMIN, Prec",
                            type=["xlsx"], accept_multiple_files=True)
@@ -255,7 +226,6 @@ if dfs:
             continue
 
         df = df.sort_values("Julian_days").reset_index(drop=True)
-        # Orden esperado por el modelo: [Julian_days, TMIN, TMAX, Prec]
         X_real = df[["Julian_days", "TMIN", "TMAX", "Prec"]].to_numpy(float)
         fechas = pd.to_datetime(df["Fecha"])
 
@@ -271,6 +241,7 @@ if dfs:
         for col in ["EMEAC (0-1) - mínimo", "EMEAC (0-1) - máximo", "EMEAC (0-1) - ajustable"]:
             pred[col.replace("(0-1)", "(%)")] = (pred[col] * 100).clip(0, 100)
 
+        # ---- Ventana 1/feb → 1/nov para gráficos (con fallback) ----
         years = pred["Fecha"].dt.year.unique()
         yr = int(years[0]) if len(years) == 1 else int(st.sidebar.selectbox("Año (reinicio 1/feb → 1/nov)", sorted(years), key=f"year_select_{nombre}"))
         fi = pd.Timestamp(year=yr, month=2, day=1)
@@ -278,7 +249,6 @@ if dfs:
         m = (pred["Fecha"] >= fi) & (pred["Fecha"] <= ff)
         pred_vis = pred.loc[m].copy()
 
-        # Fallback a rango real disponible si no hay datos en 1/feb → 1/nov
         rango_personalizado = False
         if pred_vis.empty:
             pred_vis = pred.copy()
@@ -295,6 +265,7 @@ if dfs:
 
         colores_vis = obtener_colores(pred_vis["Nivel_Emergencia_relativa"])
 
+        # ====== FIGURA: EMERREL diario ======
         st.subheader("EMERGENCIA RELATIVA DIARIA")
         fig_er = go.Figure()
         fig_er.add_bar(
@@ -309,12 +280,6 @@ if dfs:
             x=pred_vis["Fecha"], y=pred_vis["EMERREL_MA5"],
             mode="lines", name="Media móvil 5 días",
             hovertemplate="Fecha: %{x|%d-%b-%Y}<br>MA5: %{y:.3f}<extra></extra>"
-        ))
-        fig_er.add_trace(go.Scatter(
-            x=pred_vis["Fecha"], y=pred_vis["EMERREL_MA5"],
-            mode="lines", line=dict(width=0), fill="tozeroy",
-            fillcolor="rgba(135, 206, 250, 0.3)", name="Área MA5",
-            hoverinfo="skip", showlegend=False
         ))
         low_thr = float(THR_BAJO_MEDIO); med_thr = float(THR_MEDIO_ALTO)
         fig_er.add_trace(go.Scatter(x=[fi, ff], y=[low_thr, low_thr],
@@ -335,6 +300,7 @@ if dfs:
         fig_er.update_yaxes(rangemode="tozero")
         st.plotly_chart(fig_er, use_container_width=True, theme="streamlit")
 
+        # ====== FIGURA: EMERGENCIA acumulada ======
         st.subheader("EMERGENCIA ACUMULADA DIARIA")
         fig = go.Figure()
         fig.add_trace(go.Scatter(
@@ -376,18 +342,17 @@ if dfs:
                          tickformat="%d-%b" if (ff-fi).days <= 31 else "%b")
         st.plotly_chart(fig, use_container_width=True, theme="streamlit")
 
-        # Texto de rango dinámico
+        # ====== TABLA: Resultados en el rango gráfico ======
         rango_txt = f"{fi.date()} → {ff.date()}" if rango_personalizado else "1/feb → 1/nov"
         st.subheader(f"Resultados ({rango_txt}) - {nombre}")
         col_emeac = "EMEAC (%) - ajustable (rango)"
         nivel_icono = {"Bajo": "🟢 Bajo", "Medio": "🟠 Medio", "Alto": "🔴 Alto"}
-        tabla = pred_vis[["Fecha","Julian_days","Nivel_Emergencia_relativa",col_emeac]].copy()
-        tabla["Nivel_Emergencia_relativa"] = tabla["Nivel_Emergencia_relativa"].map(nivel_icono)
-        tabla = tabla.rename(columns={"Nivel_Emergencia_relativa":"Nivel de EMERREL", col_emeac:"EMEAC (%)"})
-        st.dataframe(tabla, use_container_width=True)
+        tabla_rango = pred_vis[["Fecha","Julian_days","Nivel_Emergencia_relativa",col_emeac]].copy()
+        tabla_rango["Nivel_Emergencia_relativa"] = tabla_rango["Nivel_Emergencia_relativa"].map(nivel_icono)
+        tabla_rango = tabla_rango.rename(columns={"Nivel_Emergencia_relativa":"Nivel de EMERREL", col_emeac:"EMEAC (%)"})
+        st.dataframe(tabla_rango, use_container_width=True)
 
-        csv_buf = StringIO()
-        tabla.to_csv(csv_buf, index=False)
+        csv_buf = StringIO(); tabla_rango.to_csv(csv_buf, index=False)
         st.download_button(
             f"Descargar resultados (rango) - {nombre}",
             data=csv_buf.getvalue(),
@@ -395,3 +360,27 @@ if dfs:
             mime="text/csv"
         )
 
+        # ====== TABLA: PRONÓSTICO COMPLETO (sin recortes) ======
+        st.subheader(f"Pronóstico completo disponible - {nombre}")
+        hoy = pd.Timestamp.now().normalize()
+        pred_fcst = pred.loc[pred["Fecha"] > hoy].copy()  # <<-- TODO el pronóstico
+        if pred_fcst.empty:
+            st.info("No hay registros futuros en la fuente meteo (solo histórico).")
+        else:
+            # Métricas útiles al vuelo
+            pred_fcst["EMEAC (%) - ajustable (acum)"] = (pred_fcst["EMERREL(0-1)"].cumsum() / EMEAC_ADJ_DEN * 100).clip(0,100)
+            tabla_fcst = pred_fcst[["Fecha","Julian_days","EMERREL(0-1)","Nivel_Emergencia_relativa","EMEAC (%) - ajustable (acum)"]].copy()
+            tabla_fcst["Nivel_Emergencia_relativa"] = tabla_fcst["Nivel_Emergencia_relativa"].map(nivel_icono)
+            tabla_fcst = tabla_fcst.rename(columns={
+                "Nivel_Emergencia_relativa":"Nivel de EMERREL",
+                "EMEAC (%) - ajustable (acum)":"EMEAC (%) (acum)"
+            })
+            st.dataframe(tabla_fcst, use_container_width=True)
+
+            csv_buf2 = StringIO(); tabla_fcst.to_csv(csv_buf2, index=False)
+            st.download_button(
+                f"Descargar PRONÓSTICO COMPLETO - {nombre}",
+                data=csv_buf2.getvalue(),
+                file_name=f"{nombre}_pronostico_completo.csv",
+                mime="text/csv"
+            )
