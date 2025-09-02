@@ -360,27 +360,4 @@ if dfs:
             mime="text/csv"
         )
 
-        # ====== TABLA: PRONÓSTICO COMPLETO (sin recortes) ======
-        st.subheader(f"Pronóstico completo disponible - {nombre}")
-        hoy = pd.Timestamp.now().normalize()
-        pred_fcst = pred.loc[pred["Fecha"] > hoy].copy()  # <<-- TODO el pronóstico
-        if pred_fcst.empty:
-            st.info("No hay registros futuros en la fuente meteo (solo histórico).")
-        else:
-            # Métricas útiles al vuelo
-            pred_fcst["EMEAC (%) - ajustable (acum)"] = (pred_fcst["EMERREL(0-1)"].cumsum() / EMEAC_ADJ_DEN * 100).clip(0,100)
-            tabla_fcst = pred_fcst[["Fecha","Julian_days","EMERREL(0-1)","Nivel_Emergencia_relativa","EMEAC (%) - ajustable (acum)"]].copy()
-            tabla_fcst["Nivel_Emergencia_relativa"] = tabla_fcst["Nivel_Emergencia_relativa"].map(nivel_icono)
-            tabla_fcst = tabla_fcst.rename(columns={
-                "Nivel_Emergencia_relativa":"Nivel de EMERREL",
-                "EMEAC (%) - ajustable (acum)":"EMEAC (%) (acum)"
-            })
-            st.dataframe(tabla_fcst, use_container_width=True)
-
-            csv_buf2 = StringIO(); tabla_fcst.to_csv(csv_buf2, index=False)
-            st.download_button(
-                f"Descargar PRONÓSTICO COMPLETO - {nombre}",
-                data=csv_buf2.getvalue(),
-                file_name=f"{nombre}_pronostico_completo.csv",
-                mime="text/csv"
-            )
+       
