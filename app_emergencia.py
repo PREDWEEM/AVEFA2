@@ -115,7 +115,7 @@ def _sanitize_meteo(df: pd.DataFrame) -> pd.DataFrame:
 # ====================== PERSISTENCIA LOCAL (CSV) ======================
 # Ruta configurable por secrets: LOCAL_HISTORY_PATH y modo de fusión FREEZE_HISTORY
 LOCAL_HISTORY_PATH = st.secrets.get("LOCAL_HISTORY_PATH", "avefa_history_local.csv")
-FREEZE_HISTORY = bool(st.secrets.get("FREEZE_HISTORY", False))
+FREEZE_HISTORY = bool(st.secrets.get("FREEZE_HISTORY", False))  # valor por defecto (se puede cambiar en el sidebar)
 
 def _normalize_like_hist(df: pd.DataFrame) -> pd.DataFrame:
     """Normaliza columnas y tipos a ['Fecha','Julian_days','TMAX','TMIN','Prec'] sin cambiar valores."""
@@ -196,7 +196,6 @@ def _union_histories(df_prev: pd.DataFrame, df_new: pd.DataFrame, freeze_existin
     elif new.empty:
         base = prev
     else:
-        # Orden según política
         if freeze_existing:
             concat = pd.concat([prev, new], ignore_index=True)
             keep_mode = "first"  # conserva prev
@@ -207,7 +206,6 @@ def _union_histories(df_prev: pd.DataFrame, df_new: pd.DataFrame, freeze_existin
                      .sort_values("Fecha")
                      .drop_duplicates(subset=["Fecha"], keep=keep_mode)
                      .reset_index(drop=True))
-    # Recalcular julianos y tipos
     base["Fecha"] = pd.to_datetime(base["Fecha"], errors="coerce")
     base = base.dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
     base["Julian_days"] = base["Fecha"].dt.dayofyear
@@ -253,6 +251,13 @@ st.title("Predicción de Emergencia Agrícola AVEFA")
 
 st.sidebar.header("Meteo")
 fuente_meteo = st.sidebar.radio("Fuente meteo", ["Automático (CSV público)", "Subir Excel meteo"])
+
+# <<< NUEVO: opción de congelar en el menú lateral >>>
+FREEZE_HISTORY = st.sidebar.checkbox(
+    "Congelar histórico local (no sobrescribir)",
+    value=FREEZE_HISTORY,
+    help="Si está activado, al guardar el histórico local se conservan los valores ya guardados para cada fecha."
+)
 
 if st.sidebar.button("Limpiar caché"):
     st.cache_data.clear()
