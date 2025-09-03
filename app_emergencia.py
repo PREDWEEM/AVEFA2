@@ -112,6 +112,110 @@ def _sanitize_meteo(df: pd.DataFrame) -> pd.DataFrame:
         df.loc[m, ["TMAX", "TMIN"]] = df.loc[m, ["TMIN", "TMAX"]].values
     return df
 
+# ====================== PERSISTENCIA LOCAL (CSV) ======================
+# Ruta configurable por secrets: LOCAL_HISTORY_PATH y modo de fusión FREEZE_HISTORY
+LOCAL_HISTORY_PATH = st.secrets.get("LOCAL_HISTORY_PATH", "avefa_history_local.csv")
+FREEZE_HISTORY = bool(st.secrets.get("FREEZE_HISTORY", False))
+
+def _normalize_like_hist(df: pd.DataFrame) -> pd.DataFrame:
+    """Normaliza columnas y tipos a ['Fecha','Julian_days','TMAX','TMIN','Prec'] sin cambiar valores."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
+    out = df.copy()
+    # Renombrado flexible por si cambian mayúsculas/minúsculas
+    out.columns = [str(c).strip() for c in out.columns]
+    lower_map = {c.lower(): c for c in out.columns}
+    def pick(*cands):
+        for c in cands:
+            if c in lower_map:
+                return lower_map[c]
+        return None
+    mapping = {
+        pick("fecha","date"): "Fecha",
+        pick("julian_days","julianday","julian","doy","dia_juliano"): "Julian_days",
+        pick("tmax","t_max","tx"): "TMAX",
+        pick("tmin","t_min","tn"): "TMIN",
+        pick("prec","ppt","precip","lluvia","mm","prcp"): "Prec",
+    }
+    mapping = {k: v for k, v in mapping.items() if k is not None}
+    out = out.rename(columns=mapping)
+    if "Fecha" in out.columns:
+        out["Fecha"] = pd.to_datetime(out["Fecha"], errors="coerce")
+    if "Julian_days" not in out.columns and "Fecha" in out.columns:
+        out["Julian_days"] = pd.to_datetime(out["Fecha"]).dt.dayofyear
+    if "Fecha" not in out.columns and "Julian_days" in out.columns:
+        year = pd.Timestamp.now().year
+        out["Fecha"] = pd.to_datetime(f"{year}-01-01") + pd.to_timedelta(pd.to_numeric(out["Julian_days"], errors="coerce") - 1, unit="D")
+    for c in ["TMAX","TMIN","Prec","Julian_days"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+    req = {"Fecha","Julian_days","TMAX","TMIN","Prec"}
+    if not req.issubset(out.columns):
+        # Devuelve lo que haya, pero ordena y limpia Fecha si existe
+        if "Fecha" in out.columns:
+            out = out.dropna(subset=["Fecha"])
+        return out.sort_values("Fecha").reset_index(drop=True)
+    out = out.dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
+    out["Julian_days"] = pd.to_datetime(out["Fecha"]).dt.dayofyear
+    return out[["Fecha","Julian_days","TMAX","TMIN","Prec"]]
+
+def _load_local_history(path: str) -> pd.DataFrame:
+    p = Path(path)
+    if not p.exists():
+        return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
+    try:
+        df = pd.read_csv(p)
+    except Exception:
+        try:
+            df = pd.read_excel(p)
+        except Exception:
+            return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
+    return _normalize_like_hist(df)
+
+def _save_local_history(path: str, df_hist: pd.DataFrame) -> None:
+    try:
+        # Guardar siempre CSV para simplicidad
+        cols = ["Fecha","Julian_days","TMAX","TMIN","Prec"]
+        to_write = df_hist[cols].copy() if set(cols).issubset(df_hist.columns) else df_hist.copy()
+        to_write.to_csv(path, index=False, date_format="%Y-%m-%d")
+    except Exception:
+        # Silencioso: la app no falla por no poder persistir
+        pass
+
+def _union_histories(df_prev: pd.DataFrame, df_new: pd.DataFrame, freeze_existing: bool = False) -> pd.DataFrame:
+    """Une histórico previo con nuevos datos por Fecha.
+    - freeze_existing=False: PRIORIZA nuevos valores (keep='last')
+    - freeze_existing=True: CONSERVA lo previo (keep='first')
+    """
+    prev = _normalize_like_hist(df_prev)
+    new  = _normalize_like_hist(df_new)
+    if prev.empty and new.empty:
+        return prev
+    if prev.empty:
+        base = new
+    elif new.empty:
+        base = prev
+    else:
+        # Orden según política
+        if freeze_existing:
+            concat = pd.concat([prev, new], ignore_index=True)
+            keep_mode = "first"  # conserva prev
+        else:
+            concat = pd.concat([prev, new], ignore_index=True)
+            keep_mode = "last"   # pisa con new
+        base = (concat.dropna(subset=["Fecha"])
+                     .sort_values("Fecha")
+                     .drop_duplicates(subset=["Fecha"], keep=keep_mode)
+                     .reset_index(drop=True))
+    # Recalcular julianos y tipos
+    base["Fecha"] = pd.to_datetime(base["Fecha"], errors="coerce")
+    base = base.dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
+    base["Julian_days"] = base["Fecha"].dt.dayofyear
+    for c in ["TMAX","TMIN","Prec"]:
+        if c in base.columns:
+            base[c] = pd.to_numeric(base[c], errors="coerce")
+    return base
+
 # ====================== Modelo ======================
 class PracticalANNModel:
     def __init__(self, IW, bias_IW, LW, bias_out):
@@ -195,6 +299,17 @@ if fuente_meteo == "Automático (CSV público)":
         else:
             st.success(f"Pronóstico completo detectado: {len(fcst)} día(s) futuros incluidos.")
         df_auto_sel = pd.concat([hist, fcst], ignore_index=True).drop_duplicates(subset=["Fecha"])
+
+        # ====== PERSISTENCIA: unificar con histórico local y guardar ======
+        try:
+            df_prev_local = _load_local_history(LOCAL_HISTORY_PATH)
+            df_union = _union_histories(df_prev_local, df_auto_sel, freeze_existing=FREEZE_HISTORY)
+            _save_local_history(LOCAL_HISTORY_PATH, df_union)
+            df_auto_sel = df_union  # usar consolidado persistente
+        except Exception:
+            # ante cualquier problema de IO, seguimos con df_auto_sel sin cortar la app
+            pass
+
         dfs.append(("Meteo (histórico + pronóstico completo)", df_auto_sel))
 else:
     ups = st.file_uploader("Subí uno o más .xlsx con columnas: Julian_days, TMAX, TMIN, Prec",
