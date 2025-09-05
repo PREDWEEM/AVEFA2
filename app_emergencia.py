@@ -25,60 +25,107 @@ PATH_BORDE = Path("BORDE2025.csv")
 PATH_PRON  = Path("meteo_history.csv")
 
 # ===================== Utilidades de normalización =====================
+
 def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Normaliza columnas a esquema estándar y crea 'Fecha' si es posible.
+    Estrategias:
+      - Busca columna tipo fecha por nombre ('fecha', 'date') en cualquier casing.
+      - Si no existe, intenta construir desde columnas año/mes/día (year/month/day).
+      - Si no logra fecha, devuelve DataFrame vacío (para que el caller maneje).
+    """
     if df is None or df.empty:
         return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
+
     out = df.copy()
     out.columns = [str(c).strip() for c in out.columns]
-    lower = {c.lower(): c for c in out.columns}
-    def pick(*cands):
+    lower_map = {c.lower(): c for c in out.columns}
+
+    def find_col(*cands):
         for cc in cands:
-            if cc in lower:
-                return lower[cc]
+            if cc in lower_map:
+                return lower_map[cc]
         return None
-    m = {
-        pick("fecha","date"): "Fecha",
-        pick("julian_days","jd","julianday","doy"): "Julian_days",
-        pick("tmax","tx","t_max"): "TMAX",
-        pick("tmin","tn","t_min"): "TMIN",
-        pick("prec","ppt","lluvia","prcp"): "Prec",
-    }
-    m = {k:v for k,v in m.items() if k is not None}
-    out = out.rename(columns=m)
-    # Parse Fecha
-    if "Fecha" in out.columns:
-        out["Fecha"] = pd.to_datetime(out["Fecha"], errors="coerce").dt.normalize()
-    # Si no hay Fecha pero sí Julian_days, intentar reconstruir en el año de la primera fila con fecha conocida aparte
-    if "Fecha" not in out.columns and "Julian_days" in out.columns:
-        year = pd.Timestamp.now().year
-        out["Fecha"] = pd.to_datetime(f"{year}-01-01") + pd.to_timedelta(pd.to_numeric(out["Julian_days"], errors="coerce") - 1, unit="D")
-    # Tipos numéricos
-    for c in ["TMAX","TMIN","Prec","Julian_days"]:
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce")
-    # Sanitizar meteorología
+
+    # Intentar detectar o crear 'Fecha'
+    fecha_col = find_col("fecha", "date")
+    if fecha_col is not None:
+        out["Fecha"] = pd.to_datetime(out[fecha_col], errors="coerce").dt.normalize()
+    else:
+        # Probar construir desde año/mes/día
+        ycol = find_col("año", "anio", "ano", "year", "yyyy", "yy")
+        mcol = find_col("mes", "month", "mm")
+        dcol = find_col("dia", "día", "day", "dd")
+        if ycol and mcol and dcol:
+            try:
+                y = pd.to_numeric(out[ycol], errors="coerce").astype('Int64')
+                m = pd.to_numeric(out[mcol], errors="coerce").astype('Int64')
+                d = pd.to_numeric(out[dcol], errors="coerce").astype('Int64')
+                out["Fecha"] = pd.to_datetime(dict(year=y, month=m, day=d), errors="coerce").dt.normalize()
+            except Exception:
+                out["Fecha"] = pd.NaT
+        else:
+            # última chance: si existe una columna que luzca como fecha por contenido
+            candidate = None
+            for c in out.columns:
+                try:
+                    parsed = pd.to_datetime(out[c], errors="coerce")
+                    if parsed.notna().mean() > 0.8:
+                        candidate = c
+                        break
+                except Exception:
+                    pass
+            if candidate:
+                out["Fecha"] = pd.to_datetime(out[candidate], errors="coerce").dt.normalize()
+            else:
+                # sin fecha válida
+                return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
+
+    # Mapear variables meteorológicas
+    tmax_col = find_col("tmax","tx","t_max","t máx","t máx.","tmax(°c)")
+    tmin_col = find_col("tmin","tn","t_min","t mín","t mín.","tmin(°c)")
+    prec_col = find_col("prec","ppt","lluvia","prcp","pp","precip")
+
+    if tmax_col: out["TMAX"] = pd.to_numeric(out[tmax_col], errors="coerce")
+    if tmin_col: out["TMIN"] = pd.to_numeric(out[tmin_col], errors="coerce")
+    if prec_col: out["Prec"] = pd.to_numeric(out[prec_col], errors="coerce")
+
+    # Sanitizar meteo
     if "Prec" in out.columns:
         out["Prec"] = out["Prec"].fillna(0).clip(lower=0)
+
+    # Corregir casos TMAX < TMIN
     if {"TMAX","TMIN"}.issubset(out.columns):
         bad = out["TMAX"] < out["TMIN"]
         if bad.any():
             out.loc[bad, ["TMAX","TMIN"]] = out.loc[bad, ["TMIN","TMAX"]].values
-    # Ordenar y dejar mínimas columnas
-    req = {"Fecha","TMAX","TMIN","Prec"}
-    if "Julian_days" not in out.columns and "Fecha" in out.columns:
-        out["Julian_days"] = out["Fecha"].dt.dayofyear
-    out = out.dropna(subset=["Fecha"]).sort_values("Fecha").drop_duplicates("Fecha", keep="last").reset_index(drop=True)
-    if not req.issubset(out.columns):
-        # devolver lo que haya
-        return out
-    return out[["Fecha","Julian_days","TMAX","TMIN","Prec"]]
+
+    # Generar Julian_days si falta
+    if "Julian_days" not in out.columns:
+        # Preferimos día del año real
+        if "Fecha" in out.columns:
+            out["Julian_days"] = out["Fecha"].dt.dayofyear
+        else:
+            out["Julian_days"] = pd.NA
+
+    # Orden final y limpieza
+    out = (out.dropna(subset=["Fecha"])
+              .sort_values("Fecha")
+              .drop_duplicates("Fecha", keep="last")
+              .reset_index(drop=True))
+
+    # Devolver con columnas disponibles
+    cols = ["Fecha","Julian_days","TMAX","TMIN","Prec"]
+    for c in cols:
+        if c not in out.columns:
+            out[c] = pd.NA
+    return out[cols]
 
 def load_borde():
     if not PATH_BORDE.exists():
         return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
     try:
         if PATH_BORDE.suffix.lower() == ".csv":
-            df = pd.read_csv(PATH_BORDE, parse_dates=["Fecha","date"], dayfirst=True, infer_datetime_format=True)
+            df = pd.read_csv(PATH_BORDE)
         else:
             df = pd.read_excel(PATH_BORDE)
     except Exception:
