@@ -50,7 +50,7 @@ THR_MEDIO_ALTO = 0.05
 
 # ====================== Umbrales EMEAC ======================
 EMEAC_MIN_DEN = 2.0
-EMEAC_ADJ_DEN = 4.0
+EMEAC_ADJ_DEN = 3.5
 EMEAC_MAX_DEN = 4.0
 
 # ====================== Colores por nivel ======================
