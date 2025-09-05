@@ -17,6 +17,13 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+
+def _to_num(series):
+    if series.dtype == object:
+        s = series.astype(str).str.strip().str.replace(",", ".", regex=False)
+        return pd.to_numeric(s, errors="coerce")
+    return pd.to_numeric(series, errors="coerce")
+
 from pathlib import Path
 
 st.set_page_config(page_title="PREDWEEM · BORDE2025 + Pronóstico (merge)", layout="wide")
@@ -49,7 +56,7 @@ def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     # Intentar detectar o crear 'Fecha'
     fecha_col = find_col("fecha", "date")
     if fecha_col is not None:
-        out["Fecha"] = pd.to_datetime(out[fecha_col], errors="coerce").dt.normalize()
+        out["Fecha"] = pd.to_datetime(out[fecha_col], errors="coerce", dayfirst=True).dt.normalize()
     else:
         # Probar construir desde año/mes/día
         ycol = find_col("año", "anio", "ano", "year", "yyyy", "yy")
@@ -85,9 +92,9 @@ def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     tmin_col = find_col("tmin","tn","t_min","t mín","t mín.","tmin(°c)")
     prec_col = find_col("prec","ppt","lluvia","prcp","pp","precip")
 
-    if tmax_col: out["TMAX"] = pd.to_numeric(out[tmax_col], errors="coerce")
-    if tmin_col: out["TMIN"] = pd.to_numeric(out[tmin_col], errors="coerce")
-    if prec_col: out["Prec"] = pd.to_numeric(out[prec_col], errors="coerce")
+    if tmax_col: out["TMAX"] = _to_num(out[tmax_col])
+    if tmin_col: out["TMIN"] = _to_num(out[tmin_col])
+    if prec_col: out["Prec"] = _to_num(out[prec_col])
 
     # Sanitizar meteo
     if "Prec" in out.columns:
@@ -150,9 +157,9 @@ def load_pron():
         return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
     out = pd.DataFrame({
         "Fecha": pd.to_datetime(df[date_col], errors="coerce").dt.normalize(),
-        "TMAX": pd.to_numeric(df[tmax_col], errors="coerce"),
-        "TMIN": pd.to_numeric(df[tmin_col], errors="coerce"),
-        "Prec": pd.to_numeric(df[prec_col], errors="coerce").fillna(0).clip(lower=0),
+        "TMAX": _to_num(df[tmax_col]),
+        "TMIN": _to_num(df[tmin_col]),
+        "Prec": _to_num(df[prec_col]).fillna(0).clip(lower=0),
     })
     out = out.dropna(subset=["Fecha"]).sort_values("Fecha").drop_duplicates("Fecha", keep="last").reset_index(drop=True)
     out["Julian_days"] = out["Fecha"].dt.dayofyear
