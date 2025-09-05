@@ -493,3 +493,19 @@ if dfs:
             mime="text/csv"
         )
 
+
+# ===================== 🛠 Depuración de serie de entrada =====================
+try:
+    with st.expander("🛠 Depuración de serie de entrada"):
+        _df_dbg = merged.copy()
+        _df_dbg = _df_dbg.sort_values("Fecha").reset_index(drop=True)
+        st.write({
+            "primera_fecha": str(_df_dbg["Fecha"].min().date()) if len(_df_dbg)>0 else None,
+            "ultima_fecha":  str(_df_dbg["Fecha"].max().date()) if len(_df_dbg)>0 else None,
+            "total_filas":   int(len(_df_dbg)),
+        })
+        st.markdown("**Últimas 10 fechas efectivas**")
+        st.table(_df_dbg[["Fecha"]].tail(10))
+except Exception as _e:
+    st.warning(f"No se pudo mostrar la depuración de la serie de entrada: {_e}")
+
