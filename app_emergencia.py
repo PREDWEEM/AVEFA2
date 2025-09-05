@@ -130,13 +130,22 @@ def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
 def load_borde():
     if not PATH_BORDE.exists():
         return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
+    df = None
+    # Try multiple readers robustly
     try:
-        if PATH_BORDE.suffix.lower() == ".csv":
-            df = pd.read_csv(PATH_BORDE)
-        else:
-            df = pd.read_excel(PATH_BORDE)
+        df = pd.read_csv(PATH_BORDE, sep=None, engine="python", decimal=",")
     except Exception:
-        df = pd.read_csv(PATH_BORDE, sep=";", engine="python", dtype=str)
+        try:
+            df = pd.read_csv(PATH_BORDE, sep=";", engine="python", decimal=",")
+        except Exception:
+            try:
+                df = pd.read_csv(PATH_BORDE, sep="\t", engine="python", decimal=",")
+            except Exception:
+                try:
+                    df = pd.read_excel(PATH_BORDE)
+                except Exception:
+                    # Last resort: raw read with python engine
+                    df = pd.read_csv(PATH_BORDE, engine="python", error_bad_lines=False)
     return _normalize_cols(df)
 
 def load_pron():
@@ -254,6 +263,30 @@ if merged.empty:
     st.stop()
 
 st.success(f"Serie fusionada: {merged['Fecha'].min().date()} → {merged['Fecha'].max().date()} · {len(merged)} fila(s)")
+
+# ===================== Limpieza / Imputación (opcional) =====================
+st.sidebar.markdown("### Calidad de datos")
+IMPUTACION_CAUTA = st.sidebar.toggle("Imputación cauta (ffill 1 día en TMAX/TMIN; Prec=0 si falta)", value=False)
+DROP_NAN_STRICT = st.sidebar.toggle("Descartar filas con NaN críticos (TMAX/TMIN/Fecha)", value=True)
+
+def apply_cleaning(df):
+    df = df.copy()
+    # ffill 1 día para TMAX/TMIN si está activado
+    if IMPUTACION_CAUTA:
+        for c in ["TMAX","TMIN"]:
+            if c in df.columns:
+                df[c] = df[c].ffill(limit=1)
+        if "Prec" in df.columns:
+            df["Prec"] = df["Prec"].fillna(0)
+    # si se pide, descartar filas con NaN críticos
+    if DROP_NAN_STRICT:
+        df = df.dropna(subset=["Fecha","TMAX","TMIN"])
+        df["Prec"] = df["Prec"].fillna(0)
+    return df
+
+# Aplicar limpieza al merged antes del modelado
+merged = apply_cleaning(merged)
+
 
 # ===================== Modelo =====================
 # Vector X = [Julian_days, TMAX, TMIN, Prec]
