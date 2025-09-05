@@ -17,6 +17,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+from pathlib import Path
 
 st.set_page_config(page_title="PREDWEEM · BORDE2025 + Pronóstico (merge)", layout="wide")
 
