@@ -1,6 +1,6 @@
 # app_emergencia.py — AVEFA
 # (lockdown + empalme histórico adjunto 01-ene-2025 → 03-sep-2025 + futuro público
-#  + MA5 con relleno tricolor INTERNO (verde/amarillo/rojo, sin opacidad) + botón Actualizar
+#  + MA5 con relleno tricolor INTERNO (verde/amarillo/rojo, con opacidad) + botón Actualizar
 #  + fix fechas dd/mm y DOY + lectura automática BORDE2025.csv desde GitHub)
 import streamlit as st
 import numpy as np
@@ -617,7 +617,7 @@ else:
 colores_vis = obtener_colores(pred_vis["Nivel_Emergencia_relativa"])
 pred_vis["EMERREL_MA5"] = pred_vis["EMERREL(0-1)"].rolling(window=5, min_periods=1).mean()
 
-# ====== FIGURA: EMERGENCIA RELATIVA DIARIA (MA5 con relleno tricolor INTERNO, sin opacidad) ======
+# ====== FIGURA: EMERGENCIA RELATIVA DIARIA (MA5 con relleno tricolor INTERNO, con opacidad) ======
 st.subheader("EMERGENCIA RELATIVA DIARIA")
 fig_er = go.Figure()
 
@@ -633,7 +633,7 @@ fig_er.add_bar(
     name="EMERREL (0-1)"
 )
 
-# Área interna bajo MA5 segmentada (0→0.01 verde, 0.01→0.05 amarillo, 0.05→MA5 rojo) sin opacidad
+# Área interna bajo MA5 segmentada (0→0.01 verde, 0.01→0.05 amarillo, 0.05→MA5 rojo) con opacidad
 x = pred_vis["Fecha"]
 ma = pred_vis["EMERREL_MA5"].clip(lower=0)
 thr_low = float(THR_BAJO_MEDIO)   # 0.01
@@ -644,9 +644,11 @@ y1 = np.minimum(ma, thr_low)   # tope verde
 y2 = np.minimum(ma, thr_med)   # tope amarillo
 y3 = ma                        # tope rojo
 
-GREEN  = "#00A651"
-YELLOW = "#FFC000"
-RED    = "#E53935"
+# === Colores con opacidad suave ===
+ALPHA = 0.28  # ajustá 0.20–0.35 a gusto
+GREEN_RGBA  = f"rgba(0,166,81,{ALPHA})"
+YELLOW_RGBA = f"rgba(255,192,0,{ALPHA})"
+RED_RGBA    = f"rgba(229,57,53,{ALPHA})"
 
 # Base 0
 fig_er.add_trace(go.Scatter(
@@ -658,7 +660,7 @@ fig_er.add_trace(go.Scatter(
 fig_er.add_trace(go.Scatter(
     x=x, y=y1, mode="lines",
     line=dict(width=0),
-    fill="tonexty", fillcolor=GREEN,
+    fill="tonexty", fillcolor=GREEN_RGBA,
     hoverinfo="skip", showlegend=False, name="Zona baja (verde)"
 ))
 # Baseline y1
@@ -671,7 +673,7 @@ fig_er.add_trace(go.Scatter(
 fig_er.add_trace(go.Scatter(
     x=x, y=y2, mode="lines",
     line=dict(width=0),
-    fill="tonexty", fillcolor=YELLOW,
+    fill="tonexty", fillcolor=YELLOW_RGBA,
     hoverinfo="skip", showlegend=False, name="Zona media (amarillo)"
 ))
 # Baseline y2
@@ -684,7 +686,7 @@ fig_er.add_trace(go.Scatter(
 fig_er.add_trace(go.Scatter(
     x=x, y=y3, mode="lines",
     line=dict(width=0),
-    fill="tonexty", fillcolor=RED,
+    fill="tonexty", fillcolor=RED_RGBA,
     hoverinfo="skip", showlegend=False, name="Zona alta (rojo)"
 ))
 
@@ -769,4 +771,3 @@ st.download_button(
     file_name=f"{nombre.replace(' ','_')}_{'todo' if rango_opcion=='Todo el empalme' else 'rango'}.csv",
     mime="text/csv"
 )
-
