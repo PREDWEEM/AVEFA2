@@ -1,7 +1,7 @@
 # app_emergencia.py — AVEFA
 # (lockdown + empalme histórico adjunto 01-ene-2025 → 03-sep-2025 + futuro público
-#  + MA5 sombreada + botón Actualizar + fix fechas dd/mm y DOY
-#  + LECTURA AUTOMÁTICA de BORDE2025.csv desde GitHub)
+#  + MA5 con relleno tricolor + botón Actualizar + fix fechas dd/mm y DOY
+#  + LECTURA AUTOMÁTICA de BORDE2025.csv desde GitHub + parches de robustez)
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -88,6 +88,7 @@ def load_npy_from_fixed(filename: str) -> np.ndarray:
     raw = _fetch_bytes(url)
     return np.load(BytesIO(raw), allow_pickle=False)
 
+# ===== Parche 1: CSV público robusto (sep ; y coma decimal)
 @st.cache_data(ttl=900)
 def load_public_csv():
     urls = [
@@ -97,11 +98,30 @@ def load_public_csv():
     last_err = None
     for url in urls:
         try:
-            df = pd.read_csv(url, parse_dates=["Fecha"])
-            req = {"Fecha", "Julian_days", "TMAX", "TMIN", "Prec"}
-            if not req.issubset(df.columns):
-                continue
-            return df.sort_values("Fecha").reset_index(drop=True)
+            raw = _fetch_bytes(url)
+            # intentos: (usar_sep_puntoycoma, decimal_char)
+            for use_sc, dec in [(True, ","), (True, "."), (False, ".")]:
+                try:
+                    bio = BytesIO(raw)
+                    if use_sc:
+                        df = pd.read_csv(bio, sep=";", decimal=dec, parse_dates=False)
+                    else:
+                        df = pd.read_csv(bio, decimal=dec, parse_dates=False)
+
+                    if "Fecha" in df.columns:
+                        df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce", dayfirst=True)
+
+                    req = {"Fecha", "Julian_days", "TMAX", "TMIN", "Prec"}
+                    if not req.issubset(df.columns):
+                        continue
+
+                    for c in ["Julian_days", "TMAX", "TMIN", "Prec"]:
+                        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+                    df = df.sort_values("Fecha").reset_index(drop=True)
+                    return df
+                except Exception:
+                    continue
         except Exception as e:
             last_err = e
             continue
@@ -129,29 +149,21 @@ def _sanitize_meteo(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ====================== HISTÓRICO DESDE GITHUB ======================
-# Puedes definir una URL exacta en secrets: HIST_CSV_URL
 HIST_CSV_URL_SECRET = st.secrets.get("HIST_CSV_URL", "").strip()
-
-# Candidatas por defecto (editables):
 HIST_CSV_URLS: List[str] = [
-    # Principal en el repo AVEFA2
     "https://raw.githubusercontent.com/PREDWEEM/AVEFA2/main/BORDE2025.csv",
-    # Alternativas en el repo ANN (gh-pages y github pages)
     "https://raw.githubusercontent.com/PREDWEEM/ANN/gh-pages/BORDE2025.csv",
     "https://PREDWEEM.github.io/ANN/BORDE2025.csv",
 ]
 
 def _try_read_csv_semicolon_first(url: str) -> pd.DataFrame:
-    """Intenta leer CSV con sep=';' y si falla reintenta con sep por defecto."""
     raw = _fetch_bytes(url)
-    # Primer intento: ';'
     try:
         df = pd.read_csv(BytesIO(raw), sep=";")
         if not df.empty:
             return df
     except Exception:
         pass
-    # Segundo intento: por defecto (coma)
     try:
         df = pd.read_csv(BytesIO(raw))
         return df
@@ -160,7 +172,6 @@ def _try_read_csv_semicolon_first(url: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=900)
 def load_borde_from_github() -> pd.DataFrame:
-    # 1) URL en secrets tiene prioridad
     urls = []
     if HIST_CSV_URL_SECRET:
         urls.append(HIST_CSV_URL_SECRET)
@@ -182,7 +193,6 @@ LOCAL_HISTORY_PATH = st.secrets.get("LOCAL_HISTORY_PATH", "avefa_history_local.c
 FREEZE_HISTORY = bool(st.secrets.get("FREEZE_HISTORY", False))  # valor por defecto
 
 def _normalize_like_hist(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalización para archivos locales; respeta DOY si existe y usa dayfirst=True si no."""
     if df is None or df.empty:
         return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
     out = df.copy()
@@ -239,6 +249,7 @@ def _save_local_history(path: str, df_hist: pd.DataFrame) -> None:
     except Exception:
         pass
 
+# ===== Parche 4: unión robusta + interpolación y clamps
 def _union_histories(df_prev: pd.DataFrame, df_new: pd.DataFrame, freeze_existing: bool = False) -> pd.DataFrame:
     prev = _normalize_like_hist(df_prev)
     new  = _normalize_like_hist(df_new)
@@ -256,11 +267,16 @@ def _union_histories(df_prev: pd.DataFrame, df_new: pd.DataFrame, freeze_existin
                      .drop_duplicates(subset=["Fecha"], keep=keep_mode)
                      .reset_index(drop=True))
     base["Fecha"] = pd.to_datetime(base["Fecha"], errors="coerce")
-    base = base.dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
+    base = base.dropna(subset=["Fecha"]).sort_values("Fecha").drop_duplicates(subset=["Fecha"], keep="last").reset_index(drop=True)
     base["Julian_days"] = base["Fecha"].dt.dayofyear
     for c in ["TMAX","TMIN","Prec"]:
         if c in base.columns:
-            base[c] = pd.to_numeric(cast := base[c], errors="coerce")
+            base[c] = pd.to_numeric(base[c], errors="coerce")
+    base[["Julian_days","TMAX","TMIN","Prec"]] = base[["Julian_days","TMAX","TMIN","Prec"]].interpolate(limit_direction="both")
+    m = base["TMAX"] < base["TMIN"]
+    if m.any():
+        base.loc[m, ["TMAX","TMIN"]] = base.loc[m, ["TMIN","TMAX"]].values
+    base["Prec"] = base["Prec"].clip(lower=0)
     return base
 
 # ====================== Modelo ======================
@@ -272,7 +288,7 @@ class PracticalANNModel:
         self.bias_out = float(bias_out)
         # Orden de entrada: [Julian_days, TMIN, TMAX, Prec]
         self.input_min = np.array([1, -7, 0, 0], dtype=float)
-        self.input_max = np.array([300, 25.5, 41, 84], dtype=float)
+        self.input_max = np.array([300, 25.5, 41, 84], dtype=float)  # ajustar si extendés a fin de año
         self._den = np.maximum(self.input_max - self.input_min, 1e-9)
 
     def tansig(self, x): return np.tanh(x)
@@ -319,7 +335,6 @@ with col_b:
         st.cache_data.clear()
         st.success("Caché limpiada. Volvé a correr o tocá 'Actualizar datos'.")
 
-# Persistencia local (FREEZE)
 FREEZE_HISTORY = st.sidebar.checkbox(
     "Congelar histórico local (no sobrescribir)",
     value=FREEZE_HISTORY,
@@ -355,7 +370,8 @@ def _cargar_pesos():
     return IW, bias_IW, LW, bias_out
 
 pesos = safe_run(_cargar_pesos, "No se pudieron cargar los archivos del modelo.")
-if pesos is None: st.stop()
+if pesos is None:
+    st.stop()
 IW, bias_IW, LW, bias_out = pesos
 modelo = PracticalANNModel(IW, bias_IW, LW, float(bias_out))
 
@@ -364,7 +380,6 @@ HIST_START = pd.Timestamp(2025, 1, 1)
 HIST_END   = pd.Timestamp(2025, 9, 3)   # inclusive
 
 def _normalize_meteo_generic(df_in: pd.DataFrame) -> pd.DataFrame:
-    """Normaliza el adjunto/entrada: si hay DOY, es fuente de verdad; si no, parsea Fecha con dayfirst=True."""
     if df_in is None or df_in.empty:
         return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
 
@@ -393,7 +408,6 @@ def _normalize_meteo_generic(df_in: pd.DataFrame) -> pd.DataFrame:
     if mapping:
         df = df.rename(columns=mapping)
 
-    # Reglas principales:
     if "Julian_days" in df.columns:
         df["Julian_days"] = pd.to_numeric(df["Julian_days"], errors="coerce")
         df["Fecha"] = pd.to_datetime("2025-01-01") + pd.to_timedelta(df["Julian_days"] - 1, unit="D")
@@ -421,7 +435,6 @@ def _normalize_meteo_generic(df_in: pd.DataFrame) -> pd.DataFrame:
     return df[["Fecha","Julian_days","TMAX","TMIN","Prec"]]
 
 def _load_attached_history_from_github() -> pd.DataFrame:
-    """Lee BORDE2025.csv desde GitHub (secrets o URLs candidatas)."""
     try:
         df_hist_raw = load_borde_from_github()
         st.success("BORDE2025.csv cargado automáticamente desde GitHub ✅")
@@ -431,14 +444,12 @@ def _load_attached_history_from_github() -> pd.DataFrame:
         return pd.DataFrame()
 
 def _load_attached_history_fallback() -> pd.DataFrame:
-    """Fallback: subida manual o /mnt/data."""
     up = st.file_uploader(
         "Subí el HISTÓRICO (CSV/XLSX) para 2025-01-01 → 2025-09-03 (solo si falla GitHub)",
         type=["csv","xlsx"], accept_multiple_files=False, key="hist_attach"
     )
     df_hist_raw = pd.DataFrame()
 
-    # 1) Upload, intentando sep=';' primero
     if up is not None:
         try:
             if up.name.lower().endswith(".xlsx"):
@@ -453,7 +464,6 @@ def _load_attached_history_fallback() -> pd.DataFrame:
             st.error(f"No se pudo leer el archivo adjunto ({e}).")
             return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
     else:
-        # 2) /mnt/data BORDE2025.csv (sep=';' luego por defecto)
         try:
             p = Path("/mnt/data/BORDE2025.csv")
             if p.exists():
@@ -481,6 +491,17 @@ if not df_hist_attached.empty:
     df_hist_attached = df_hist_attached.loc[m].copy().reset_index(drop=True)
     if df_hist_attached.empty:
         st.error("El histórico (GitHub/fallback) no tiene filas dentro de 2025-01-01 → 2025-09-03.")
+
+# ===== Parche 3: verificación de huecos en todo el histórico esperado
+if not df_hist_attached.empty:
+    full_hist_range = pd.date_range(HIST_START, HIST_END, freq="D")
+    present = pd.to_datetime(df_hist_attached["Fecha"]).dt.normalize().unique()
+    missing = [d for d in full_hist_range if d.to_datetime64() not in present]
+    if missing:
+        st.warning("El histórico adjunto tiene huecos reales en 2025-01-01 → 2025-09-03: " +
+                   ", ".join(pd.DatetimeIndex(missing).strftime("%d-%m").tolist()))
+    else:
+        st.info("Histórico (01-ene → 03-sep) completo ✅")
 
 def _leer_public_csv_solo_futuro():
     df_pub = load_public_csv()
@@ -554,26 +575,27 @@ if "pred_full_empalme" not in st.session_state:
 
 recalcular_pred = (st.session_state.last_empalme_hash != empalme_hash)
 
-# --- Cargar pesos y predecir ---
-IW, bias_IW, LW, bias_out = pesos
-modelo = PracticalANNModel(IW, bias_IW, LW, float(bias_out))
+# ===== Parche 2: aseguramos predicción disponible
+def _recompute_pred(df_emp):
+    X_all = df_emp[["Julian_days","TMIN","TMAX","Prec"]].to_numpy(float)
+    pred_all_ = modelo.predict(X_all, thr_bajo_medio=THR_BAJO_MEDIO, thr_medio_alto=THR_MEDIO_ALTO)
+    pred_all_["Fecha"] = pd.to_datetime(df_emp["Fecha"])
+    pred_all_["Julian_days"] = df_emp["Julian_days"]
+    pred_all_["EMERREL acumulado"] = pred_all_["EMERREL(0-1)"].cumsum()
+    return pred_all_
 
-if recalcular_pred:
-    X_all = df_empalmado[["Julian_days","TMIN","TMAX","Prec"]].to_numpy(float)
-    pred_all = modelo.predict(X_all, thr_bajo_medio=THR_BAJO_MEDIO, thr_medio_alto=THR_MEDIO_ALTO)
-    pred_all["Fecha"] = pd.to_datetime(df_empalmado["Fecha"])
-    pred_all["Julian_days"] = df_empalmado["Julian_days"]
-    pred_all["EMERREL acumulado"] = pred_all["EMERREL(0-1)"].cumsum()
+if recalcular_pred or st.session_state.get("pred_full_empalme") is None:
+    pred_all = _recompute_pred(df_empalmado)
     st.session_state.pred_full_empalme = pred_all
     st.session_state.last_empalme_hash = empalme_hash
 else:
-    pred_all = st.session_state.pred_full_empalme
+    pred_all = st.session_state.pred_full_empalme.copy()
 
-# Avisos
-if df_future_pub is not None and df_future_pub.empty:
-    st.info("El CSV público no contiene días posteriores a 2025-09-03. Solo se mostrará el histórico de GitHub.")
+# Avisos de futuro (Parche 6)
+futuros = int((df_empalmado["Fecha"] > HIST_END).sum())
+if futuros == 0:
+    st.info("Empalme OK. Por ahora no hay días posteriores a 2025-09-03 en el CSV público; se muestra solo el histórico de GitHub.")
 else:
-    futuros = (df_empalmado["Fecha"] > HIST_END).sum()
     st.success(f"Empalme OK. Futuro detectado: {futuros} día(s) posteriores a 2025-09-03.")
 
 # ====================== Procesamiento y visualización ======================
@@ -583,145 +605,188 @@ df = df_empalmado.copy()
 ok, msg = validar_columnas_meteo(df)
 if not ok:
     st.warning(f"{nombre}: {msg}")
+    st.stop()
+
+pred = pred_all.copy()
+
+# EMEAC global (sobre TODO el empalme)
+pred["EMEAC (0-1) - mínimo"]    = pred["EMERREL acumulado"] / EMEAC_MIN_DEN
+pred["EMEAC (0-1) - máximo"]    = pred["EMERREL acumulado"] / EMEAC_MAX_DEN
+pred["EMEAC (0-1) - ajustable"] = pred["EMERREL acumulado"] / EMEAC_ADJ_DEN
+for col in ["EMEAC (0-1) - mínimo", "EMEAC (0-1) - máximo", "EMEAC (0-1) - ajustable"]:
+    pred[col.replace("(0-1)", "(%)")] = (pred[col] * 100).clip(0, 100)
+
+# ====== Rango de visualización ======
+if rango_opcion == "Todo el empalme":
+    pred_vis = pred.copy()
+    fi, ff = pred_vis["Fecha"].min(), pred_vis["Fecha"].max()
+    rango_txt = f"{fi.date()} → {ff.date()}"
+    y_min = pred_vis["EMEAC (%) - mínimo"]
+    y_max = pred_vis["EMEAC (%) - máximo"]
+    y_adj = pred_vis["EMEAC (%) - ajustable"]
 else:
-    pred = pred_all.copy()
-
-    # EMEAC global (sobre TODO el empalme)
-    pred["EMEAC (0-1) - mínimo"]    = pred["EMERREL acumulado"] / EMEAC_MIN_DEN
-    pred["EMEAC (0-1) - máximo"]    = pred["EMERREL acumulado"] / EMEAC_MAX_DEN
-    pred["EMEAC (0-1) - ajustable"] = pred["EMERREL acumulado"] / EMEAC_ADJ_DEN
-    for col in ["EMEAC (0-1) - mínimo", "EMEAC (0-1) - máximo", "EMEAC (0-1) - ajustable"]:
-        pred[col.replace("(0-1)", "(%)")] = (pred[col] * 100).clip(0, 100)
-
-    # ====== Rango de visualización ======
-    if rango_opcion == "Todo el empalme":
+    years = pred["Fecha"].dt.year.unique()
+    yr = int(years[0]) if len(years) == 1 else int(st.sidebar.selectbox(
+        "Año (reinicio 1/feb → 1/nov)", sorted(years), key=f"year_select_{nombre}"
+    ))
+    fi = pd.Timestamp(year=yr, month=2, day=1)
+    ff = pd.Timestamp(year=yr, month=11, day=1)
+    m = (pred["Fecha"] >= fi) & (pred["Fecha"] <= ff)
+    pred_vis = pred.loc[m].copy()
+    if pred_vis.empty:
         pred_vis = pred.copy()
         fi, ff = pred_vis["Fecha"].min(), pred_vis["Fecha"].max()
-        rango_txt = f"{fi.date()} → {ff.date()}"
-        y_min = pred_vis["EMEAC (%) - mínimo"]
-        y_max = pred_vis["EMEAC (%) - máximo"]
-        y_adj = pred_vis["EMEAC (%) - ajustable"]
-    else:
-        years = pred["Fecha"].dt.year.unique()
-        yr = int(years[0]) if len(years) == 1 else int(st.sidebar.selectbox(
-            "Año (reinicio 1/feb → 1/nov)", sorted(years), key=f"year_select_{nombre}"
-        ))
-        fi = pd.Timestamp(year=yr, month=2, day=1)
-        ff = pd.Timestamp(year=yr, month=11, day=1)
-        m = (pred["Fecha"] >= fi) & (pred["Fecha"] <= ff)
-        pred_vis = pred.loc[m].copy()
-        if pred_vis.empty:
-            pred_vis = pred.copy()
-            fi, ff = pred_vis["Fecha"].min(), pred_vis["Fecha"].max()
 
-        # Recalcular acumulados y EMEAC dentro del rango (reiniciado)
-        pred_vis["EMERREL acumulado (reiniciado)"] = pred_vis["EMERREL(0-1)"].cumsum()
-        pred_vis["EMEAC (0-1) - mínimo (rango)"]    = pred_vis["EMERREL acumulado (reiniciado)"] / EMEAC_MIN_DEN
-        pred_vis["EMEAC (0-1) - máximo (rango)"]    = pred_vis["EMERREL acumulado (reiniciado)"] / EMEAC_MAX_DEN
-        pred_vis["EMEAC (0-1) - ajustable (rango)"] = pred_vis["EMERREL acumulado (reiniciado)"] / EMEAC_ADJ_DEN
-        for col in ["EMEAC (0-1) - mínimo (rango)", "EMEAC (0-1) - máximo (rango)", "EMEAC (0-1) - ajustable (rango)"]:
-            pred_vis[col.replace("(0-1)", "(%)")] = (pred_vis[col] * 100).clip(0, 100)
+    # Recalcular acumulados y EMEAC dentro del rango (reiniciado)
+    pred_vis["EMERREL acumulado (reiniciado)"] = pred_vis["EMERREL(0-1)"].cumsum()
+    pred_vis["EMEAC (0-1) - mínimo (rango)"]    = pred_vis["EMERREL acumulado (reiniciado)"] / EMEAC_MIN_DEN
+    pred_vis["EMEAC (0-1) - máximo (rango)"]    = pred_vis["EMERREL acumulado (reiniciado)"] / EMEAC_MAX_DEN
+    pred_vis["EMEAC (0-1) - ajustable (rango)"] = pred_vis["EMERREL acumulado (reiniciado)"] / EMEAC_ADJ_DEN
+    for col in ["EMEAC (0-1) - mínimo (rango)", "EMEAC (0-1) - máximo (rango)", "EMEAC (0-1) - ajustable (rango)"]:
+        pred_vis[col.replace("(0-1)", "(%)")] = (pred_vis[col] * 100).clip(0, 100)
 
-        rango_txt = "1/feb → 1/nov"
-        y_min = pred_vis["EMEAC (%) - mínimo (rango)"]
-        y_max = pred_vis["EMEAC (%) - máximo (rango)"]
-        y_adj = pred_vis["EMEAC (%) - ajustable (rango)"]
+    rango_txt = "1/feb → 1/nov"
+    y_min = pred_vis["EMEAC (%) - mínimo (rango)"]
+    y_max = pred_vis["EMEAC (%) - máximo (rango)"]
+    y_adj = pred_vis["EMEAC (%) - ajustable (rango)"]
 
-    # ====== Colores por nivel y MA5 ======
-    colores_vis = obtener_colores(pred_vis["Nivel_Emergencia_relativa"])
-    pred_vis["EMERREL_MA5"] = pred_vis["EMERREL(0-1)"].rolling(window=5, min_periods=1).mean()
+# ====== Colores por nivel y MA5 ======
+colores_vis = obtener_colores(pred_vis["Nivel_Emergencia_relativa"])
+pred_vis["EMERREL_MA5"] = pred_vis["EMERREL(0-1)"].rolling(window=5, min_periods=1).mean()
 
-    # ====== FIGURA: EMERREL diario (con MA5 sombreada) ======
-    st.subheader("EMERGENCIA RELATIVA DIARIA")
-    fig_er = go.Figure()
-    fig_er.add_bar(
-        x=pred_vis["Fecha"],
-        y=pred_vis["EMERREL(0-1)"],
-        marker=dict(color=colores_vis.tolist()),
-        customdata=pred_vis["Nivel_Emergencia_relativa"].map(
-            {"Bajo": "🟢 Bajo", "Medio": "🟠 Medio", "Alto": "🔴 Alto"}
-        ),
-        hovertemplate="Fecha: %{x|%d-%b-%Y}<br>EMERREL: %{y:.3f}<br>Nivel: %{customdata}<extra></extra>",
-        name="EMERREL (0-1)"
-    )
-    fig_er.add_trace(go.Scatter(
-        x=pred_vis["Fecha"], y=pred_vis["EMERREL_MA5"],
-        mode="lines", line=dict(width=2),
-        name="Media móvil 5 días",
-        hovertemplate="Fecha: %{x|%d-%b-%Y}<br>MA5: %{y:.3f}<extra></extra>"
-    ))
-    fig_er.add_trace(go.Scatter(
-        x=pred_vis["Fecha"], y=pred_vis["EMERREL_MA5"],
-        mode="lines", line=dict(width=0),
-        fill="tozeroy", fillcolor="rgba(65,105,225,0.15)",
-        hoverinfo="skip", showlegend=False
-    ))
-    # Líneas de referencia
-    low_thr = float(THR_BAJO_MEDIO); med_thr = float(THR_MEDIO_ALTO)
-    fig_er.add_trace(go.Scatter(x=[fi, ff], y=[low_thr, low_thr],
-        mode="lines", line=dict(color=COLOR_MAP["Bajo"], dash="dot"),
-        name=f"Bajo (≤ {low_thr:.3f})", hoverinfo="skip"))
-    fig_er.add_trace(go.Scatter(x=[fi, ff], y=[med_thr, med_thr],
-        mode="lines", line=dict(color=COLOR_MAP["Medio"], dash="dot"),
-        name=f"Medio (≤ {med_thr:.3f})", hoverinfo="skip"))
-    fig_er.add_trace(go.Scatter(x=[None], y=[None], mode="lines",
-        line=dict(color=COLOR_MAP["Alto"], dash="dot"),
-        name=f"Alto (> {med_thr:.3f})", hoverinfo="skip"))
-    fig_er.update_layout(
-        xaxis_title="Fecha", yaxis_title="EMERREL (0-1)",
-        hovermode="x unified", legend_title="Referencias", height=650
-    )
-    fig_er.update_xaxes(range=[fi, ff], dtick="D1" if (ff-fi).days <= 31 else "M1",
-                        tickformat="%d-%b" if (ff-fi).days <= 31 else "%b")
-    fig_er.update_yaxes(rangemode="tozero")
-    st.plotly_chart(fig_er, use_container_width=True, theme="streamlit")
+# ====== FIGURA: EMERGENCIA RELATIVA DIARIA (con relleno tricolor bajo MA5) ======
+st.subheader("EMERGENCIA RELATIVA DIARIA")
+fig_er = go.Figure()
 
-    # ====== FIGURA: EMERGENCIA acumulada ======
-    st.subheader("EMERGENCIA ACUMULADA DIARIA")
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=pred_vis["Fecha"], y=y_max, mode="lines", line=dict(width=0),
-        name="Máximo", hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Máximo: %{y:.1f}%<extra></extra>"
-    ))
-    fig.add_trace(go.Scatter(
-        x=pred_vis["Fecha"], y=y_min, mode="lines", line=dict(width=0),
-        fill="tonexty", name="Mínimo",
-        hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Mínimo: %{y:.1f}%<extra></extra>"
-    ))
-    fig.add_trace(go.Scatter(
-        x=pred_vis["Fecha"], y=y_adj, mode="lines", line=dict(width=2.5),
-        name=f"Umbral ajustable (/{EMEAC_ADJ_DEN:.2f})",
-        hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Ajustable: %{y:.1f}%<extra></extra>"
-    ))
-    for nivel in [25, 50, 75, 90]:
-        try:
-            fig.add_hline(y=nivel, line_dash="dash", opacity=0.6, annotation_text=f"{nivel}%")
-        except Exception:
-            fig.add_trace(go.Scatter(x=[pred_vis["Fecha"].min(), pred_vis["Fecha"].max()],
-                                     y=[nivel, nivel], mode="lines", line=dict(dash="dash"), showlegend=False))
-    fig.update_layout(
-        xaxis_title="Fecha", yaxis_title="EMEAC (%)",
-        yaxis=dict(range=[0, 100]), hovermode="x unified",
-        legend_title="Referencias", height=600
-    )
-    fig.update_xaxes(range=[fi, ff], dtick="D1" if (ff-fi).days <= 31 else "M1",
-                     tickformat="%d-%b" if (ff-fi).days <= 31 else "%b")
-    st.plotly_chart(fig, use_container_width=True, theme="streamlit")
+# Barras coloreadas por nivel
+fig_er.add_bar(
+    x=pred_vis["Fecha"],
+    y=pred_vis["EMERREL(0-1)"],
+    marker=dict(color=colores_vis.tolist()),
+    customdata=pred_vis["Nivel_Emergencia_relativa"].map(
+        {"Bajo": "🟢 Bajo", "Medio": "🟠 Medio", "Alto": "🔴 Alto"}
+    ),
+    hovertemplate="Fecha: %{x|%d-%b-%Y}<br>EMERREL: %{y:.3f}<br>Nivel: %{customdata}<extra></extra>",
+    name="EMERREL (0-1)"
+)
 
-    # ====== TABLA: Resultados ======
-    st.subheader(f"Resultados ({rango_txt}) - {nombre}")
-    col_emeac = "EMEAC (%) - ajustable" if rango_opcion == "Todo el empalme" else "EMEAC (%) - ajustable (rango)"
-    nivel_icono = {"Bajo": "🟢 Bajo", "Medio": "🟠 Medio", "Alto": "🔴 Alto"}
-    tabla_rango = pred_vis[["Fecha","Julian_days","Nivel_Emergencia_relativa",col_emeac]].copy()
-    tabla_rango["Nivel_Emergencia_relativa"] = tabla_rango["Nivel_Emergencia_relativa"].map(nivel_icono)
-    tabla_rango = tabla_rango.rename(columns={"Nivel_Emergencia_relativa":"Nivel de EMERREL", col_emeac:"EMEAC (%)"})
-    st.dataframe(tabla_rango, use_container_width=True)
+# Rellenos suaves por tramos de MA5
+x = pred_vis["Fecha"]
+ma = pred_vis["EMERREL_MA5"]
+thr_low  = float(THR_BAJO_MEDIO)   # 0.01
+thr_med  = float(THR_MEDIO_ALTO)   # 0.05
 
-    csv_buf = StringIO(); tabla_rango.to_csv(csv_buf, index=False)
-    st.download_button(
-        f"Descargar resultados ({'todo' if rango_opcion=='Todo el empalme' else 'rango'}) - {nombre}",
-        data=csv_buf.getvalue(),
-        file_name=f"{nombre.replace(' ','_')}_{'todo' if rango_opcion=='Todo el empalme' else 'rango'}.csv",
-        mime="text/csv"
-    )
+mask_low  = ma <= thr_low
+mask_med  = (ma > thr_low) & (ma <= thr_med)
+mask_high = ma > thr_med
+
+y_low  = [v if m else None for v, m in zip(ma, mask_low)]
+y_med  = [v if m else None for v, m in zip(ma, mask_med)]
+y_high = [v if m else None for v, m in zip(ma, mask_high)]
+
+# Verde (bajo)
+fig_er.add_trace(go.Scatter(
+    x=x, y=y_low, mode="lines",
+    line=dict(width=0),
+    fill="tozeroy", fillcolor="rgba(44,160,44,0.18)",
+    hoverinfo="skip", showlegend=False, name="MA5 zona baja"
+))
+# Naranja (medio)
+fig_er.add_trace(go.Scatter(
+    x=x, y=y_med, mode="lines",
+    line=dict(width=0),
+    fill="tozeroy", fillcolor="rgba(255,127,14,0.18)",
+    hoverinfo="skip", showlegend=False, name="MA5 zona media"
+))
+# Rojo (alto)
+fig_er.add_trace(go.Scatter(
+    x=x, y=y_high, mode="lines",
+    line=dict(width=0),
+    fill="tozeroy", fillcolor="rgba(214,39,40,0.18)",
+    hoverinfo="skip", showlegend=False, name="MA5 zona alta"
+))
+
+# Línea MA5 encima de los rellenos
+fig_er.add_trace(go.Scatter(
+    x=x, y=ma, mode="lines", line=dict(width=2),
+    name="Media móvil 5 días",
+    hovertemplate="Fecha: %{x|%d-%b-%Y}<br>MA5: %{y:.3f}<extra></extra>"
+))
+
+# Líneas de referencia
+low_thr = thr_low; med_thr = thr_med
+fig_er.add_trace(go.Scatter(x=[x.min(), x.max()], y=[low_thr, low_thr],
+    mode="lines", line=dict(color=COLOR_MAP["Bajo"], dash="dot"),
+    name=f"Bajo (≤ {low_thr:.3f})", hoverinfo="skip"))
+fig_er.add_trace(go.Scatter(x=[x.min(), x.max()], y=[med_thr, med_thr],
+    mode="lines", line=dict(color=COLOR_MAP["Medio"], dash="dot"),
+    name=f"Medio (≤ {med_thr:.3f})", hoverinfo="skip"))
+fig_er.add_trace(go.Scatter(x=[None], y=[None], mode="lines",
+    line=dict(color=COLOR_MAP["Alto"], dash="dot"),
+    name=f"Alto (> {med_thr:.3f})", hoverinfo="skip"))
+
+fig_er.update_layout(
+    xaxis_title="Fecha", yaxis_title="EMERREL (0-1)",
+    hovermode="x unified", legend_title="Referencias", height=650
+)
+fi, ff = x.min(), x.max()
+fig_er.update_xaxes(range=[fi, ff], dtick="D1" if (ff-fi).days <= 31 else "M1",
+                    tickformat="%d-%b" if (ff-fi).days <= 31 else "%b")
+fig_er.update_yaxes(rangemode="tozero")
+st.plotly_chart(fig_er, use_container_width=True, theme="streamlit")
+
+# ====== FIGURA: EMERGENCIA acumulada ======
+st.subheader("EMERGENCIA ACUMULADA DIARIA")
+fig = go.Figure()
+fig.add_trace(go.Scatter(
+    x=pred_vis["Fecha"], y=y_max, mode="lines", line=dict(width=0),
+    name="Máximo", hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Máximo: %{y:.1f}%<extra></extra>"
+))
+fig.add_trace(go.Scatter(
+    x=pred_vis["Fecha"], y=y_min, mode="lines", line=dict(width=0),
+    fill="tonexty", name="Mínimo",
+    hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Mínimo: %{y:.1f}%<extra></extra>"
+))
+fig.add_trace(go.Scatter(
+    x=pred_vis["Fecha"], y=y_adj, mode="lines", line=dict(width=2.5),
+    name=f"Umbral ajustable (/{EMEAC_ADJ_DEN:.2f})",
+    hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Ajustable: %{y:.1f}%<extra></extra>"
+))
+for nivel in [25, 50, 75, 90]:
+    try:
+        fig.add_hline(y=nivel, line_dash="dash", opacity=0.6, annotation_text=f"{nivel}%")
+    except Exception:
+        fig.add_trace(go.Scatter(x=[pred_vis["Fecha"].min(), pred_vis["Fecha"].max()],
+                                 y=[nivel, nivel], mode="lines", line=dict(dash="dash"), showlegend=False))
+fig.update_layout(
+    xaxis_title="Fecha", yaxis_title="EMEAC (%)",
+    yaxis=dict(range=[0, 100]), hovermode="x unified",
+    legend_title="Referencias", height=600
+)
+fig.update_xaxes(range=[fi, ff], dtick="D1" if (ff-fi).days <= 31 else "M1",
+                 tickformat="%d-%b" if (ff-fi).days <= 31 else "%b")
+st.plotly_chart(fig, use_container_width=True, theme="streamlit")
+
+# ====== TABLA: Resultados ======
+st.subheader(f"Resultados ({'1/feb → 1/nov' if rango_opcion!='Todo el empalme' else f'{pred_vis['Fecha'].min().date()} → {pred_vis['Fecha'].max().date()}'}) - {nombre}")
+col_emeac = "EMEAC (%) - ajustable" if rango_opcion == "Todo el empalme" else "EMEAC (%) - ajustable (rango)"
+nivel_icono = {"Bajo": "🟢 Bajo", "Medio": "🟠 Medio", "Alto": "🔴 Alto"}
+tabla_rango = pred_vis[["Fecha","Julian_days","Nivel_Emergencia_relativa",col_emeac]].copy()
+tabla_rango["Nivel_Emergencia_relativa"] = tabla_rango["Nivel_Emergencia_relativa"].map(nivel_icono)
+tabla_rango = tabla_rango.rename(columns={"Nivel_Emergencia_relativa":"Nivel de EMERREL", col_emeac:"EMEAC (%)"})
+
+# Parche 5: tabla ordenada y sin NaN
+tabla_rango = tabla_rango.sort_values("Fecha").reset_index(drop=True)
+tabla_rango["Nivel de EMERREL"] = tabla_rango["Nivel de EMERREL"].fillna("🟢 Bajo")
+tabla_rango["EMEAC (%)"] = pd.to_numeric(tabla_rango["EMEAC (%)"], errors="coerce").fillna(0).clip(0, 100)
+
+st.dataframe(tabla_rango, use_container_width=True)
+
+csv_buf = StringIO(); tabla_rango.to_csv(csv_buf, index=False)
+st.download_button(
+    f"Descargar resultados ({'todo' if rango_opcion=='Todo el empalme' else 'rango'}) - {nombre}",
+    data=csv_buf.getvalue(),
+    file_name=f"{nombre.replace(' ','_')}_{'todo' if rango_opcion=='Todo el empalme' else 'rango'}.csv",
+    mime="text/csv"
+)
 
