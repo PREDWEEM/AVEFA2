@@ -1,6 +1,6 @@
 # app_emergencia.py — AVEFA
 # (lockdown + empalme histórico adjunto 01-ene-2025 → 03-sep-2025 + futuro público
-#  + MA5 con relleno tricolor + botón Actualizar + fix fechas dd/mm y DOY
+#  + MA5 con relleno tricolor INTERNO + botón Actualizar + fix fechas dd/mm y DOY
 #  + LECTURA AUTOMÁTICA de BORDE2025.csv desde GitHub + parches de robustez)
 import streamlit as st
 import numpy as np
@@ -88,7 +88,7 @@ def load_npy_from_fixed(filename: str) -> np.ndarray:
     raw = _fetch_bytes(url)
     return np.load(BytesIO(raw), allow_pickle=False)
 
-# ===== Parche 1: CSV público robusto (sep ; y coma decimal)
+# ===== CSV público robusto (sep ; y coma decimal)
 @st.cache_data(ttl=900)
 def load_public_csv():
     urls = [
@@ -249,7 +249,7 @@ def _save_local_history(path: str, df_hist: pd.DataFrame) -> None:
     except Exception:
         pass
 
-# ===== Parche 4: unión robusta + interpolación y clamps
+# ===== Unión robusta + interpolación y clamps
 def _union_histories(df_prev: pd.DataFrame, df_new: pd.DataFrame, freeze_existing: bool = False) -> pd.DataFrame:
     prev = _normalize_like_hist(df_prev)
     new  = _normalize_like_hist(df_new)
@@ -492,7 +492,7 @@ if not df_hist_attached.empty:
     if df_hist_attached.empty:
         st.error("El histórico (GitHub/fallback) no tiene filas dentro de 2025-01-01 → 2025-09-03.")
 
-# ===== Parche 3: verificación de huecos en todo el histórico esperado
+# Verificación de huecos en todo el histórico esperado
 if not df_hist_attached.empty:
     full_hist_range = pd.date_range(HIST_START, HIST_END, freq="D")
     present = pd.to_datetime(df_hist_attached["Fecha"]).dt.normalize().unique()
@@ -575,7 +575,7 @@ if "pred_full_empalme" not in st.session_state:
 
 recalcular_pred = (st.session_state.last_empalme_hash != empalme_hash)
 
-# ===== Parche 2: aseguramos predicción disponible
+# ===== Aseguramos predicción disponible
 def _recompute_pred(df_emp):
     X_all = df_emp[["Julian_days","TMIN","TMAX","Prec"]].to_numpy(float)
     pred_all_ = modelo.predict(X_all, thr_bajo_medio=THR_BAJO_MEDIO, thr_medio_alto=THR_MEDIO_ALTO)
@@ -591,7 +591,7 @@ if recalcular_pred or st.session_state.get("pred_full_empalme") is None:
 else:
     pred_all = st.session_state.pred_full_empalme.copy()
 
-# Avisos de futuro (Parche 6)
+# Avisos de futuro
 futuros = int((df_empalmado["Fecha"] > HIST_END).sum())
 if futuros == 0:
     st.info("Empalme OK. Por ahora no hay días posteriores a 2025-09-03 en el CSV público; se muestra solo el histórico de GitHub.")
@@ -654,7 +654,7 @@ else:
 colores_vis = obtener_colores(pred_vis["Nivel_Emergencia_relativa"])
 pred_vis["EMERREL_MA5"] = pred_vis["EMERREL(0-1)"].rolling(window=5, min_periods=1).mean()
 
-# ====== FIGURA: EMERGENCIA RELATIVA DIARIA (con relleno tricolor bajo MA5) ======
+# ====== FIGURA: EMERGENCIA RELATIVA DIARIA (MA5 con relleno tricolor INTERNO) ======
 st.subheader("EMERGENCIA RELATIVA DIARIA")
 fig_er = go.Figure()
 
@@ -670,72 +670,72 @@ fig_er.add_bar(
     name="EMERREL (0-1)"
 )
 
-# Rellenos suaves por tramos de MA5
+# Área interna bajo MA5 segmentada por umbrales (0→0.01 verde, 0.01→0.05 naranja, 0.05→MA5 rojo)
 x = pred_vis["Fecha"]
-ma = pred_vis["EMERREL_MA5"]
-thr_low  = float(THR_BAJO_MEDIO)   # 0.01
-thr_med  = float(THR_MEDIO_ALTO)   # 0.05
+ma = pred_vis["EMERREL_MA5"].clip(lower=0)
+thr_low = float(THR_BAJO_MEDIO)   # 0.01
+thr_med = float(THR_MEDIO_ALTO)   # 0.05
 
-mask_low  = ma <= thr_low
-mask_med  = (ma > thr_low) & (ma <= thr_med)
-mask_high = ma > thr_med
+# "Tiras" apiladas: y0 -> y1 -> y2 -> y3 (tonexty)
+y0 = np.zeros(len(ma))
+y1 = np.minimum(ma, thr_low)         # verde
+y2 = np.minimum(ma, thr_med)         # naranja (cubre también el tramo verde; se ve por opacidad)
+y3 = ma                              # rojo (cubre todo; se ve por opacidad)
 
-y_low  = [v if m else None for v, m in zip(ma, mask_low)]
-y_med  = [v if m else None for v, m in zip(ma, mask_med)]
-y_high = [v if m else None for v, m in zip(ma, mask_high)]
-
-# Verde (bajo)
+# Base
 fig_er.add_trace(go.Scatter(
-    x=x, y=y_low, mode="lines",
-    line=dict(width=0),
-    fill="tozeroy", fillcolor="rgba(44,160,44,0.18)",
+    x=x, y=y0, mode="lines", line=dict(width=0),
+    hoverinfo="skip", showlegend=False
+))
+# Verde
+fig_er.add_trace(go.Scatter(
+    x=x, y=y1, mode="lines", line=dict(width=0),
+    fill="tonexty", fillcolor="rgba(44,160,44,0.18)",
     hoverinfo="skip", showlegend=False, name="MA5 zona baja"
 ))
-# Naranja (medio)
+# Naranja
 fig_er.add_trace(go.Scatter(
-    x=x, y=y_med, mode="lines",
-    line=dict(width=0),
-    fill="tozeroy", fillcolor="rgba(255,127,14,0.18)",
+    x=x, y=y2, mode="lines", line=dict(width=0),
+    fill="tonexty", fillcolor="rgba(255,127,14,0.18)",
     hoverinfo="skip", showlegend=False, name="MA5 zona media"
 ))
-# Rojo (alto)
+# Rojo
 fig_er.add_trace(go.Scatter(
-    x=x, y=y_high, mode="lines",
-    line=dict(width=0),
-    fill="tozeroy", fillcolor="rgba(214,39,40,0.18)",
+    x=x, y=y3, mode="lines", line=dict(width=0),
+    fill="tonexty", fillcolor="rgba(214,39,40,0.18)",
     hoverinfo="skip", showlegend=False, name="MA5 zona alta"
 ))
 
-# Línea MA5 encima de los rellenos
+# Línea MA5 por encima del relleno
 fig_er.add_trace(go.Scatter(
     x=x, y=ma, mode="lines", line=dict(width=2),
     name="Media móvil 5 días",
     hovertemplate="Fecha: %{x|%d-%b-%Y}<br>MA5: %{y:.3f}<extra></extra>"
 ))
 
-# Líneas de referencia
-low_thr = thr_low; med_thr = thr_med
-fig_er.add_trace(go.Scatter(x=[x.min(), x.max()], y=[low_thr, low_thr],
+# Líneas de referencia (umbral bajo y medio)
+fig_er.add_trace(go.Scatter(x=[x.min(), x.max()], y=[thr_low, thr_low],
     mode="lines", line=dict(color=COLOR_MAP["Bajo"], dash="dot"),
-    name=f"Bajo (≤ {low_thr:.3f})", hoverinfo="skip"))
-fig_er.add_trace(go.Scatter(x=[x.min(), x.max()], y=[med_thr, med_thr],
+    name=f"Bajo (≤ {thr_low:.3f})", hoverinfo="skip"))
+fig_er.add_trace(go.Scatter(x=[x.min(), x.max()], y=[thr_med, thr_med],
     mode="lines", line=dict(color=COLOR_MAP["Medio"], dash="dot"),
-    name=f"Medio (≤ {med_thr:.3f})", hoverinfo="skip"))
+    name=f"Medio (≤ {thr_med:.3f})", hoverinfo="skip"))
 fig_er.add_trace(go.Scatter(x=[None], y=[None], mode="lines",
     line=dict(color=COLOR_MAP["Alto"], dash="dot"),
-    name=f"Alto (> {med_thr:.3f})", hoverinfo="skip"))
+    name=f"Alto (> {thr_med:.3f})", hoverinfo="skip"))
 
+# Layout
+fi, ff = x.min(), x.max()
 fig_er.update_layout(
     xaxis_title="Fecha", yaxis_title="EMERREL (0-1)",
     hovermode="x unified", legend_title="Referencias", height=650
 )
-fi, ff = x.min(), x.max()
 fig_er.update_xaxes(range=[fi, ff], dtick="D1" if (ff-fi).days <= 31 else "M1",
                     tickformat="%d-%b" if (ff-fi).days <= 31 else "%b")
 fig_er.update_yaxes(rangemode="tozero")
 st.plotly_chart(fig_er, use_container_width=True, theme="streamlit")
 
-# ====== FIGURA: EMERGENCIA acumulada ======
+# ====== FIGURA: EMERGENCIA ACUMULADA ======
 st.subheader("EMERGENCIA ACUMULADA DIARIA")
 fig = go.Figure()
 fig.add_trace(go.Scatter(
@@ -768,14 +768,14 @@ fig.update_xaxes(range=[fi, ff], dtick="D1" if (ff-fi).days <= 31 else "M1",
 st.plotly_chart(fig, use_container_width=True, theme="streamlit")
 
 # ====== TABLA: Resultados ======
-st.subheader(f"Resultados ({'1/feb → 1/nov' if rango_opcion!='Todo el empalme' else f'{pred_vis['Fecha'].min().date()} → {pred_vis['Fecha'].max().date()}'}) - {nombre}")
+st.subheader(f"Resultados ({rango_txt}) - {nombre}")
 col_emeac = "EMEAC (%) - ajustable" if rango_opcion == "Todo el empalme" else "EMEAC (%) - ajustable (rango)"
 nivel_icono = {"Bajo": "🟢 Bajo", "Medio": "🟠 Medio", "Alto": "🔴 Alto"}
 tabla_rango = pred_vis[["Fecha","Julian_days","Nivel_Emergencia_relativa",col_emeac]].copy()
 tabla_rango["Nivel_Emergencia_relativa"] = tabla_rango["Nivel_Emergencia_relativa"].map(nivel_icono)
 tabla_rango = tabla_rango.rename(columns={"Nivel_Emergencia_relativa":"Nivel de EMERREL", col_emeac:"EMEAC (%)"})
 
-# Parche 5: tabla ordenada y sin NaN
+# Tabla ordenada y sin NaN
 tabla_rango = tabla_rango.sort_values("Fecha").reset_index(drop=True)
 tabla_rango["Nivel de EMERREL"] = tabla_rango["Nivel de EMERREL"].fillna("🟢 Bajo")
 tabla_rango["EMEAC (%)"] = pd.to_numeric(tabla_rango["EMEAC (%)"], errors="coerce").fillna(0).clip(0, 100)
@@ -789,4 +789,3 @@ st.download_button(
     file_name=f"{nombre.replace(' ','_')}_{'todo' if rango_opcion=='Todo el empalme' else 'rango'}.csv",
     mime="text/csv"
 )
-
