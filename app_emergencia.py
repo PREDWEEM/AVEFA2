@@ -1,4 +1,4 @@
-# app_emergencia.py — AVEFA (lockdown + empalme histórico adjunto 01-ene-2025 → 03-sep-2025 + futuro público + MA5 sombreada + botón Actualizar c/ st.rerun)
+# app_emergencia.py — AVEFA (lockdown + empalme histórico adjunto 01-ene-2025 → 03-sep-2025 + futuro público + MA5 sombreada + botón Actualizar + fix fechas dd/mm y DOY)
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -44,7 +44,7 @@ def _safe_rerun():
         st.rerun()  # Streamlit >= 1.27
     except Exception:
         try:
-            st.experimental_rerun()  # fallback para versiones viejas
+            st.experimental_rerun()  # fallback
         except Exception:
             st.warning("No pude forzar el rerun automáticamente. Volvé a ejecutar la app.")
 
@@ -128,6 +128,7 @@ LOCAL_HISTORY_PATH = st.secrets.get("LOCAL_HISTORY_PATH", "avefa_history_local.c
 FREEZE_HISTORY = bool(st.secrets.get("FREEZE_HISTORY", False))  # valor por defecto
 
 def _normalize_like_hist(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalización para archivos locales; respeta DOY si existe y usa dayfirst=True si no."""
     if df is None or df.empty:
         return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
     out = df.copy()
@@ -146,23 +147,21 @@ def _normalize_like_hist(df: pd.DataFrame) -> pd.DataFrame:
         (pick("prec","ppt","precip","lluvia","mm","prcp") or "Prec"): "Prec",
     }
     out = out.rename(columns=mapping)
-    if "Fecha" in out.columns:
-        out["Fecha"] = pd.to_datetime(out["Fecha"], errors="coerce")
-    if "Julian_days" not in out.columns and "Fecha" in out.columns:
+
+    if "Julian_days" in out.columns:
+        out["Julian_days"] = pd.to_numeric(out["Julian_days"], errors="coerce")
+        out["Fecha"] = pd.to_datetime("2025-01-01") + pd.to_timedelta(out["Julian_days"] - 1, unit="D")
+    elif "Fecha" in out.columns:
+        out["Fecha"] = pd.to_datetime(out["Fecha"], errors="coerce", dayfirst=True)
         out["Julian_days"] = pd.to_datetime(out["Fecha"]).dt.dayofyear
-    if "Fecha" not in out.columns and "Julian_days" in out.columns:
-        year = pd.Timestamp.now().year
-        out["Fecha"] = pd.to_datetime(f"{year}-01-01") + pd.to_timedelta(pd.to_numeric(out["Julian_days"], errors="coerce") - 1, unit="D")
-    for c in ["TMAX","TMIN","Prec","Julian_days"]:
+    else:
+        return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
+
+    for c in ["TMAX","TMIN","Prec"]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
-    req = {"Fecha","Julian_days","TMAX","TMIN","Prec"}
-    if not req.issubset(out.columns):
-        if "Fecha" in out.columns:
-            out = out.dropna(subset=["Fecha"])
-        return out.sort_values("Fecha").reset_index(drop=True)
+
     out = out.dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
-    out["Julian_days"] = pd.to_datetime(out["Fecha"]).dt.dayofyear
     return out[["Fecha","Julian_days","TMAX","TMIN","Prec"]]
 
 def _load_local_history(path: str) -> pd.DataFrame:
@@ -311,6 +310,7 @@ HIST_START = pd.Timestamp(2025, 1, 1)
 HIST_END   = pd.Timestamp(2025, 9, 3)   # inclusive
 
 def _normalize_meteo_generic(df_in: pd.DataFrame) -> pd.DataFrame:
+    """Normaliza el adjunto/entrada: si hay DOY, es fuente de verdad; si no, parsea Fecha con dayfirst=True."""
     if df_in is None or df_in.empty:
         return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
 
@@ -336,29 +336,22 @@ def _normalize_meteo_generic(df_in: pd.DataFrame) -> pd.DataFrame:
     if c_tmax:  mapping[c_tmax]  = "TMAX"
     if c_tmin:  mapping[c_tmin]  = "TMIN"
     if c_prec:  mapping[c_prec]  = "Prec"
-
     if mapping:
         df = df.rename(columns=mapping)
 
-    if "Fecha" in df.columns:
-        df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
-
-    if "Fecha" not in df.columns and "Julian_days" in df.columns:
+    # Reglas principales:
+    if "Julian_days" in df.columns:
         df["Julian_days"] = pd.to_numeric(df["Julian_days"], errors="coerce")
         df["Fecha"] = pd.to_datetime("2025-01-01") + pd.to_timedelta(df["Julian_days"] - 1, unit="D")
-
-    if "Julian_days" not in df.columns and "Fecha" in df.columns:
-        df["Julian_days"] = pd.to_datetime(df["Fecha"], errors="coerce").dt.dayofyear
-
-    if "Fecha" not in df.columns:
+    elif "Fecha" in df.columns:
+        df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce", dayfirst=True)
+        df["Julian_days"] = pd.to_datetime(df["Fecha"]).dt.dayofyear
+    else:
         return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
 
-    for c in ["Julian_days","TMAX","TMIN","Prec"]:
+    for c in ["TMAX","TMIN","Prec"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df = df.loc[df["Fecha"].notna()].sort_values("Fecha").reset_index(drop=True)
-    df["Julian_days"] = pd.to_datetime(df["Fecha"]).dt.dayofyear
     if "Prec" in df.columns:
         df["Prec"] = df["Prec"].clip(lower=0)
     if {"TMAX","TMIN"}.issubset(df.columns):
@@ -366,6 +359,7 @@ def _normalize_meteo_generic(df_in: pd.DataFrame) -> pd.DataFrame:
         if m.any():
             df.loc[m, ["TMAX","TMIN"]] = df.loc[m, ["TMIN","TMAX"]].values
 
+    df = df.dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
     for need in ["TMAX","TMIN","Prec"]:
         if need not in df.columns:
             df[need] = np.nan
@@ -379,7 +373,7 @@ def _load_attached_history() -> pd.DataFrame:
     )
     df_hist_raw = pd.DataFrame()
 
-    # 1) Preferir upload (lector ';' porque el archivo viene así)
+    # Preferir upload (lector ';' porque el archivo viene así)
     if up is not None:
         try:
             if up.name.lower().endswith(".xlsx"):
@@ -394,7 +388,7 @@ def _load_attached_history() -> pd.DataFrame:
             st.error(f"No se pudo leer el archivo adjunto ({e}). Verificá formato/columnas.")
             return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
     else:
-        # 2) Ruta conocida en /mnt/data (también con ';')
+        # Fallback en /mnt/data
         try:
             p = Path("/mnt/data/BORDE2025.csv")
             if p.exists():
@@ -476,6 +470,18 @@ except Exception:
 
 if df_empalmado.empty:
     st.stop()
+
+# --- Chequeo de continuidad en Agosto 2025 ---
+aug_start = pd.Timestamp(2025, 8, 1)
+aug_end   = pd.Timestamp(2025, 8, 31)
+cal_aug = pd.date_range(aug_start, aug_end, freq="D")
+fechas_emp = pd.to_datetime(df_empalmado["Fecha"]).dt.normalize().unique()
+faltan_aug = [d for d in cal_aug if d.normalize().to_datetime64() not in fechas_emp]
+if faltan_aug:
+    st.warning(f"Faltan {len(faltan_aug)} fecha(s) de agosto en el empalme: " +
+               ", ".join(d.strftime("%d-%m") for d in faltan_aug))
+else:
+    st.info("Agosto 2025 completo en el empalme ✅")
 
 # ===== Hash del empalme y recálculo automático del modelo =====
 def _df_hash(df: pd.DataFrame) -> str:
@@ -666,4 +672,3 @@ else:
         file_name=f"{nombre.replace(' ','_')}_{'todo' if rango_opcion=='Todo el empalme' else 'rango'}.csv",
         mime="text/csv"
     )
-
