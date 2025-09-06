@@ -1,4 +1,7 @@
-# app_emergencia.py — AVEFA (lockdown + empalme histórico adjunto 01-ene-2025 → 03-sep-2025 + futuro público + MA5 sombreada + botón Actualizar + fix fechas dd/mm y DOY)
+# app_emergencia.py — AVEFA
+# (lockdown + empalme histórico adjunto 01-ene-2025 → 03-sep-2025 + futuro público
+#  + MA5 sombreada + botón Actualizar + fix fechas dd/mm y DOY
+#  + LECTURA AUTOMÁTICA de BORDE2025.csv desde GitHub)
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -7,7 +10,7 @@ from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
 from pathlib import Path
 import plotly.graph_objects as go
-from typing import Callable, Any
+from typing import Callable, Any, List
 import hashlib
 
 # =================== LOCKDOWN UI ===================
@@ -75,7 +78,7 @@ def _fetch_bytes(url: str, timeout: int = 20) -> bytes:
         with urlopen(req, timeout=timeout) as resp:
             return resp.read()
     except (HTTPError, URLError):
-        raise RuntimeError("No se pudo descargar el recurso remoto.")
+        raise RuntimeError(f"No se pudo descargar el recurso remoto: {url}")
     except Exception:
         raise RuntimeError("Error descargando recurso remoto.")
 
@@ -91,6 +94,7 @@ def load_public_csv():
         "https://PREDWEEM.github.io/ANN/meteo_daily.csv",
         "https://raw.githubusercontent.com/PREDWEEM/ANN/gh-pages/meteo_daily.csv"
     ]
+    last_err = None
     for url in urls:
         try:
             df = pd.read_csv(url, parse_dates=["Fecha"])
@@ -98,9 +102,10 @@ def load_public_csv():
             if not req.issubset(df.columns):
                 continue
             return df.sort_values("Fecha").reset_index(drop=True)
-        except Exception:
+        except Exception as e:
+            last_err = e
             continue
-    raise RuntimeError("No se pudo cargar el CSV público.")
+    raise RuntimeError(f"No se pudo cargar el CSV público. Último error: {last_err}")
 
 def validar_columnas_meteo(df: pd.DataFrame):
     req = {"Julian_days", "TMAX", "TMIN", "Prec"}
@@ -122,6 +127,55 @@ def _sanitize_meteo(df: pd.DataFrame) -> pd.DataFrame:
     if m.any():
         df.loc[m, ["TMAX", "TMIN"]] = df.loc[m, ["TMIN", "TMAX"]].values
     return df
+
+# ====================== HISTÓRICO DESDE GITHUB ======================
+# Puedes definir una URL exacta en secrets: HIST_CSV_URL
+HIST_CSV_URL_SECRET = st.secrets.get("HIST_CSV_URL", "").strip()
+
+# Candidatas por defecto (editables):
+HIST_CSV_URLS: List[str] = [
+    # Principal en el repo AVEFA2
+    "https://raw.githubusercontent.com/PREDWEEM/AVEFA2/main/BORDE2025.csv",
+    # Alternativas en el repo ANN (gh-pages y github pages)
+    "https://raw.githubusercontent.com/PREDWEEM/ANN/gh-pages/BORDE2025.csv",
+    "https://PREDWEEM.github.io/ANN/BORDE2025.csv",
+]
+
+def _try_read_csv_semicolon_first(url: str) -> pd.DataFrame:
+    """Intenta leer CSV con sep=';' y si falla reintenta con sep por defecto."""
+    raw = _fetch_bytes(url)
+    # Primer intento: ';'
+    try:
+        df = pd.read_csv(BytesIO(raw), sep=";")
+        if not df.empty:
+            return df
+    except Exception:
+        pass
+    # Segundo intento: por defecto (coma)
+    try:
+        df = pd.read_csv(BytesIO(raw))
+        return df
+    except Exception as e:
+        raise RuntimeError(f"No se pudo leer CSV desde {url} ({e})")
+
+@st.cache_data(ttl=900)
+def load_borde_from_github() -> pd.DataFrame:
+    # 1) URL en secrets tiene prioridad
+    urls = []
+    if HIST_CSV_URL_SECRET:
+        urls.append(HIST_CSV_URL_SECRET)
+    urls.extend(HIST_CSV_URLS)
+
+    last_err = None
+    for url in urls:
+        try:
+            df = _try_read_csv_semicolon_first(url)
+            if not df.empty:
+                return df
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"No pude leer BORDE2025.csv desde GitHub. Último error: {last_err}")
 
 # ====================== PERSISTENCIA LOCAL (CSV) ======================
 LOCAL_HISTORY_PATH = st.secrets.get("LOCAL_HISTORY_PATH", "avefa_history_local.csv")
@@ -206,7 +260,7 @@ def _union_histories(df_prev: pd.DataFrame, df_new: pd.DataFrame, freeze_existin
     base["Julian_days"] = base["Fecha"].dt.dayofyear
     for c in ["TMAX","TMIN","Prec"]:
         if c in base.columns:
-            base[c] = pd.to_numeric(base[c], errors="coerce")
+            base[c] = pd.to_numeric(cast := base[c], errors="coerce")
     return base
 
 # ====================== Modelo ======================
@@ -248,7 +302,7 @@ class PracticalANNModel:
 st.title("Predicción de Emergencia Agrícola AVEFA")
 
 st.sidebar.header("Meteo")
-st.sidebar.caption("Histórico adjunto 01-ene-2025 → 03-sep-2025 + futuro del CSV público.")
+st.sidebar.caption("Histórico BORDE2025.csv se carga automáticamente desde GitHub; futuro desde el CSV público.")
 
 # === Botones de actualización / caché ===
 if "cache_bust" not in st.session_state:
@@ -305,7 +359,7 @@ if pesos is None: st.stop()
 IW, bias_IW, LW, bias_out = pesos
 modelo = PracticalANNModel(IW, bias_IW, LW, float(bias_out))
 
-# ====================== EMPALME: histórico adjunto + futuro público ======================
+# ====================== EMPALME: histórico GitHub + futuro público ======================
 HIST_START = pd.Timestamp(2025, 1, 1)
 HIST_END   = pd.Timestamp(2025, 9, 3)   # inclusive
 
@@ -366,14 +420,25 @@ def _normalize_meteo_generic(df_in: pd.DataFrame) -> pd.DataFrame:
 
     return df[["Fecha","Julian_days","TMAX","TMIN","Prec"]]
 
-def _load_attached_history() -> pd.DataFrame:
+def _load_attached_history_from_github() -> pd.DataFrame:
+    """Lee BORDE2025.csv desde GitHub (secrets o URLs candidatas)."""
+    try:
+        df_hist_raw = load_borde_from_github()
+        st.success("BORDE2025.csv cargado automáticamente desde GitHub ✅")
+        return _normalize_meteo_generic(df_hist_raw)
+    except Exception as e:
+        st.warning(f"No se pudo cargar BORDE2025.csv desde GitHub ({e}). Intentando fallback...")
+        return pd.DataFrame()
+
+def _load_attached_history_fallback() -> pd.DataFrame:
+    """Fallback: subida manual o /mnt/data."""
     up = st.file_uploader(
-        "Subí el HISTÓRICO (CSV/XLSX) para 2025-01-01 → 2025-09-03",
+        "Subí el HISTÓRICO (CSV/XLSX) para 2025-01-01 → 2025-09-03 (solo si falla GitHub)",
         type=["csv","xlsx"], accept_multiple_files=False, key="hist_attach"
     )
     df_hist_raw = pd.DataFrame()
 
-    # Preferir upload (lector ';' porque el archivo viene así)
+    # 1) Upload, intentando sep=';' primero
     if up is not None:
         try:
             if up.name.lower().endswith(".xlsx"):
@@ -385,10 +450,10 @@ def _load_attached_history() -> pd.DataFrame:
                     up.seek(0)
                     df_hist_raw = pd.read_csv(up)
         except Exception as e:
-            st.error(f"No se pudo leer el archivo adjunto ({e}). Verificá formato/columnas.")
+            st.error(f"No se pudo leer el archivo adjunto ({e}).")
             return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
     else:
-        # Fallback en /mnt/data
+        # 2) /mnt/data BORDE2025.csv (sep=';' luego por defecto)
         try:
             p = Path("/mnt/data/BORDE2025.csv")
             if p.exists():
@@ -397,41 +462,25 @@ def _load_attached_history() -> pd.DataFrame:
                 except Exception:
                     df_hist_raw = pd.read_csv(p)
         except Exception as e:
-            st.warning(f"No se pudo leer /mnt/data/BORDE2025.csv ({e}).")
+            st.info(f"No se pudo leer /mnt/data/BORDE2025.csv ({e}).")
             return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
 
     if df_hist_raw.empty:
-        st.warning("No se detectó histórico adjunto; se continuará solo con el CSV público.")
         return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
 
-    df_hist = _normalize_meteo_generic(df_hist_raw)
+    return _normalize_meteo_generic(df_hist_raw)
 
-    if "Fecha" not in df_hist.columns or df_hist.empty:
-        st.error(
-            "El histórico adjunto no contiene columnas reconocibles para 'Fecha' ni 'Julian_days'. "
-            "Encabezados detectados: " + ", ".join(map(str, df_hist_raw.columns))
-        )
-        return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
+# Carga priorizando GitHub
+df_hist_attached = _load_attached_history_from_github()
+if df_hist_attached.empty:
+    df_hist_attached = _load_attached_history_fallback()
 
-    m = (df_hist["Fecha"] >= HIST_START) & (df_hist["Fecha"] <= HIST_END)
-    df_hist = df_hist.loc[m].copy().reset_index(drop=True)
-
-    if df_hist.empty:
-        st.error("El histórico adjunto no tiene filas dentro de 2025-01-01 → 2025-09-03.")
-        return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
-
-    faltantes = [c for c in ["Julian_days","TMAX","TMIN","Prec"] if df_hist[c].isna().any()]
-    if faltantes:
-        st.warning(f"El histórico adjunto tiene NaN en: {', '.join(faltantes)}. Se interpolará.")
-        df_hist[["Julian_days","TMAX","TMIN","Prec"]] = df_hist[["Julian_days","TMAX","TMIN","Prec"]].interpolate(
-            limit_direction="both"
-        )
-
-    st.success(
-        f"Histórico adjunto OK: {df_hist['Fecha'].min().date()} → {df_hist['Fecha'].max().date()} "
-        f"({len(df_hist)} filas)."
-    )
-    return df_hist
+# Acotar al rango histórico esperado
+if not df_hist_attached.empty:
+    m = (df_hist_attached["Fecha"] >= HIST_START) & (df_hist_attached["Fecha"] <= HIST_END)
+    df_hist_attached = df_hist_attached.loc[m].copy().reset_index(drop=True)
+    if df_hist_attached.empty:
+        st.error("El histórico (GitHub/fallback) no tiene filas dentro de 2025-01-01 → 2025-09-03.")
 
 def _leer_public_csv_solo_futuro():
     df_pub = load_public_csv()
@@ -442,10 +491,9 @@ def _leer_public_csv_solo_futuro():
     df_future = df_pub.loc[df_pub["Fecha"] > HIST_END].copy()
     return df_future
 
-df_hist_attached = _load_attached_history()
 df_future_pub = safe_run(_leer_public_csv_solo_futuro, "No se pudo cargar el CSV público.")
 
-# Unión: adjunto (manda en 1-ene→3-sep) + público (>3-sep)
+# Unión: GitHub (manda en 1-ene→3-sep) + público (>3-sep)
 if df_hist_attached is not None and not df_hist_attached.empty:
     base_hist = df_hist_attached.copy()
 else:
@@ -506,6 +554,10 @@ if "pred_full_empalme" not in st.session_state:
 
 recalcular_pred = (st.session_state.last_empalme_hash != empalme_hash)
 
+# --- Cargar pesos y predecir ---
+IW, bias_IW, LW, bias_out = pesos
+modelo = PracticalANNModel(IW, bias_IW, LW, float(bias_out))
+
 if recalcular_pred:
     X_all = df_empalmado[["Julian_days","TMIN","TMAX","Prec"]].to_numpy(float)
     pred_all = modelo.predict(X_all, thr_bajo_medio=THR_BAJO_MEDIO, thr_medio_alto=THR_MEDIO_ALTO)
@@ -519,13 +571,13 @@ else:
 
 # Avisos
 if df_future_pub is not None and df_future_pub.empty:
-    st.info("El CSV público no contiene días posteriores a 2025-09-03. Solo se mostrará el histórico adjunto.")
+    st.info("El CSV público no contiene días posteriores a 2025-09-03. Solo se mostrará el histórico de GitHub.")
 else:
     futuros = (df_empalmado["Fecha"] > HIST_END).sum()
     st.success(f"Empalme OK. Futuro detectado: {futuros} día(s) posteriores a 2025-09-03.")
 
 # ====================== Procesamiento y visualización ======================
-nombre = "Histórico adjunto + Pronóstico público"
+nombre = "Histórico GitHub + Pronóstico público"
 df = df_empalmado.copy()
 
 ok, msg = validar_columnas_meteo(df)
@@ -672,3 +724,4 @@ else:
         file_name=f"{nombre.replace(' ','_')}_{'todo' if rango_opcion=='Todo el empalme' else 'rango'}.csv",
         mime="text/csv"
     )
+
