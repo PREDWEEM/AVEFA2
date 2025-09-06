@@ -59,7 +59,7 @@ FNAME_LW   = "LW.npy"
 FNAME_BOUT = "bias_out.npy"
 
 # ====================== Umbrales EMERREL ======================
-THR_BAJO_MEDIO = 0.015
+THR_BAJO_MEDIO = 0.01
 THR_MEDIO_ALTO = 0.05
 
 # ====================== Umbrales EMEAC ======================
