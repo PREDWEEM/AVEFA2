@@ -1,4 +1,4 @@
-# app_emergencia.py — AVEFA (lockdown + empalme histórico adjunto 01-ene-2025 → 03-sep-2025 + futuro público + MA5 sombreada + botón Actualizar)
+# app_emergencia.py — AVEFA (lockdown + empalme histórico adjunto 01-ene-2025 → 03-sep-2025 + futuro público + MA5 sombreada + botón Actualizar c/ st.rerun)
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -30,13 +30,23 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# =================== Utilidades de error seguro ===================
+# =================== Utilidades ===================
 def safe_run(fn: Callable[[], Any], user_msg: str):
     try:
         return fn()
     except Exception:
         st.error(user_msg)
         return None
+
+def _safe_rerun():
+    """Compatibilidad para forzar rerun en versiones nuevas/viejas de Streamlit."""
+    try:
+        st.rerun()  # Streamlit >= 1.27
+    except Exception:
+        try:
+            st.experimental_rerun()  # fallback para versiones viejas
+        except Exception:
+            st.warning("No pude forzar el rerun automáticamente. Volvé a ejecutar la app.")
 
 # ====================== Config pesos ======================
 GITHUB_BASE_URL = "https://raw.githubusercontent.com/PREDWEEM/AVEFA2/main"
@@ -250,7 +260,7 @@ with col_a:
     if st.button("🔄 Actualizar datos"):
         st.cache_data.clear()
         st.session_state.cache_bust += 1
-        st.experimental_rerun()
+        _safe_rerun()
 with col_b:
     if st.button("🧹 Limpiar caché"):
         st.cache_data.clear()
@@ -369,7 +379,7 @@ def _load_attached_history() -> pd.DataFrame:
     )
     df_hist_raw = pd.DataFrame()
 
-    # 1) Preferir upload (lector ';' porque tu archivo viene así)
+    # 1) Preferir upload (lector ';' porque el archivo viene así)
     if up is not None:
         try:
             if up.name.lower().endswith(".xlsx"):
@@ -530,7 +540,6 @@ else:
         pred_vis = pred.copy()
         fi, ff = pred_vis["Fecha"].min(), pred_vis["Fecha"].max()
         rango_txt = f"{fi.date()} → {ff.date()}"
-        # Columnas de EMEAC para todo
         y_min = pred_vis["EMEAC (%) - mínimo"]
         y_max = pred_vis["EMEAC (%) - máximo"]
         y_adj = pred_vis["EMEAC (%) - ajustable"]
@@ -657,3 +666,4 @@ else:
         file_name=f"{nombre.replace(' ','_')}_{'todo' if rango_opcion=='Todo el empalme' else 'rango'}.csv",
         mime="text/csv"
     )
+
