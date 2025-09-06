@@ -1,6 +1,6 @@
 # app_emergencia.py — AVEFA
 # (lockdown + empalme histórico adjunto 01-ene-2025 → 03-sep-2025 + futuro público
-#  + MA5 con relleno tricolor INTERNO + botón Actualizar + fix fechas dd/mm y DOY
+#  + MA5 con relleno tricolor INTERNO (verde/amarillo/rojo) + botón Actualizar + fix fechas dd/mm y DOY
 #  + LECTURA AUTOMÁTICA de BORDE2025.csv desde GitHub + parches de robustez)
 import streamlit as st
 import numpy as np
@@ -67,8 +67,12 @@ EMEAC_MIN_DEN = 3.0
 EMEAC_ADJ_DEN = 4.0
 EMEAC_MAX_DEN = 5.0
 
-# ====================== Colores por nivel ======================
-COLOR_MAP = {"Bajo": "#2ca02c", "Medio": "#ff7f0e", "Alto": "#d62728"}
+# ====================== Colores por nivel (intensos) ======================
+COLOR_MAP = {
+    "Bajo":  "#00A651",  # verde intenso
+    "Medio": "#FFC000",  # amarillo intenso
+    "Alto":  "#E53935"   # rojo intenso
+}
 COLOR_FALLBACK = "#808080"
 
 # ====================== Utilidades de red/archivos ======================
@@ -664,46 +668,45 @@ fig_er.add_bar(
     y=pred_vis["EMERREL(0-1)"],
     marker=dict(color=colores_vis.tolist()),
     customdata=pred_vis["Nivel_Emergencia_relativa"].map(
-        {"Bajo": "🟢 Bajo", "Medio": "🟠 Medio", "Alto": "🔴 Alto"}
+        {"Bajo": "🟢 Bajo", "Medio": "🟡 Medio", "Alto": "🔴 Alto"}
     ),
     hovertemplate="Fecha: %{x|%d-%b-%Y}<br>EMERREL: %{y:.3f}<br>Nivel: %{customdata}<extra></extra>",
     name="EMERREL (0-1)"
 )
 
-# Área interna bajo MA5 segmentada por umbrales (0→0.01 verde, 0.01→0.05 naranja, 0.05→MA5 rojo)
+# Área interna bajo MA5 segmentada: 0→0.01 (verde), 0.01→0.05 (amarillo), 0.05→MA5 (rojo)
 x = pred_vis["Fecha"]
 ma = pred_vis["EMERREL_MA5"].clip(lower=0)
 thr_low = float(THR_BAJO_MEDIO)   # 0.01
 thr_med = float(THR_MEDIO_ALTO)   # 0.05
 
-# "Tiras" apiladas: y0 -> y1 -> y2 -> y3 (tonexty)
 y0 = np.zeros(len(ma))
-y1 = np.minimum(ma, thr_low)         # verde
-y2 = np.minimum(ma, thr_med)         # naranja (cubre también el tramo verde; se ve por opacidad)
-y3 = ma                              # rojo (cubre todo; se ve por opacidad)
+y1 = np.minimum(ma, thr_low)   # verde
+y2 = np.minimum(ma, thr_med)   # amarillo
+y3 = ma                        # rojo
 
 # Base
 fig_er.add_trace(go.Scatter(
     x=x, y=y0, mode="lines", line=dict(width=0),
     hoverinfo="skip", showlegend=False
 ))
-# Verde
+# Verde (más intenso, mayor opacidad)
 fig_er.add_trace(go.Scatter(
     x=x, y=y1, mode="lines", line=dict(width=0),
-    fill="tonexty", fillcolor="rgba(44,160,44,0.18)",
-    hoverinfo="skip", showlegend=False, name="MA5 zona baja"
+    fill="tonexty", fillcolor="rgba(0,166,81,0.35)",  # VERDE
+    hoverinfo="skip", showlegend=False, name="Zona baja (verde)"
 ))
-# Naranja
+# Amarillo
 fig_er.add_trace(go.Scatter(
     x=x, y=y2, mode="lines", line=dict(width=0),
-    fill="tonexty", fillcolor="rgba(255,127,14,0.18)",
-    hoverinfo="skip", showlegend=False, name="MA5 zona media"
+    fill="tonexty", fillcolor="rgba(255,192,0,0.35)",  # AMARILLO
+    hoverinfo="skip", showlegend=False, name="Zona media (amarillo)"
 ))
 # Rojo
 fig_er.add_trace(go.Scatter(
     x=x, y=y3, mode="lines", line=dict(width=0),
-    fill="tonexty", fillcolor="rgba(214,39,40,0.18)",
-    hoverinfo="skip", showlegend=False, name="MA5 zona alta"
+    fill="tonexty", fillcolor="rgba(229,57,53,0.35)",  # ROJO
+    hoverinfo="skip", showlegend=False, name="Zona alta (rojo)"
 ))
 
 # Línea MA5 por encima del relleno
@@ -713,7 +716,7 @@ fig_er.add_trace(go.Scatter(
     hovertemplate="Fecha: %{x|%d-%b-%Y}<br>MA5: %{y:.3f}<extra></extra>"
 ))
 
-# Líneas de referencia (umbral bajo y medio)
+# Líneas de referencia (umbral bajo y medio) usando la paleta global
 fig_er.add_trace(go.Scatter(x=[x.min(), x.max()], y=[thr_low, thr_low],
     mode="lines", line=dict(color=COLOR_MAP["Bajo"], dash="dot"),
     name=f"Bajo (≤ {thr_low:.3f})", hoverinfo="skip"))
@@ -768,9 +771,9 @@ fig.update_xaxes(range=[fi, ff], dtick="D1" if (ff-fi).days <= 31 else "M1",
 st.plotly_chart(fig, use_container_width=True, theme="streamlit")
 
 # ====== TABLA: Resultados ======
-st.subheader(f"Resultados ({rango_txt}) - {nombre}")
+st.subheader(f"Resultados ({'1/feb → 1/nov' if rango_opcion!='Todo el empalme' else f'{pred_vis['Fecha'].min().date()} → {pred_vis['Fecha'].max().date()}'}) - {nombre}")
 col_emeac = "EMEAC (%) - ajustable" if rango_opcion == "Todo el empalme" else "EMEAC (%) - ajustable (rango)"
-nivel_icono = {"Bajo": "🟢 Bajo", "Medio": "🟠 Medio", "Alto": "🔴 Alto"}
+nivel_icono = {"Bajo": "🟢 Bajo", "Medio": "🟡 Medio", "Alto": "🔴 Alto"}
 tabla_rango = pred_vis[["Fecha","Julian_days","Nivel_Emergencia_relativa",col_emeac]].copy()
 tabla_rango["Nivel_Emergencia_relativa"] = tabla_rango["Nivel_Emergencia_relativa"].map(nivel_icono)
 tabla_rango = tabla_rango.rename(columns={"Nivel_Emergencia_relativa":"Nivel de EMERREL", col_emeac:"EMEAC (%)"})
