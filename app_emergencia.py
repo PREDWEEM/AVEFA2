@@ -645,7 +645,7 @@ y2 = np.minimum(ma, thr_med)   # tope amarillo
 y3 = ma                        # tope rojo
 
 # === Colores con opacidad suave ===
-ALPHA = 0.35  # ajustá 0.20–0.35 a gusto
+ALPHA = 0.20  # ajustá 0.20–0.35 a gusto
 GREEN_RGBA  = f"rgba(0,166,81,{ALPHA})"
 YELLOW_RGBA = f"rgba(255,192,0,{ALPHA})"
 RED_RGBA    = f"rgba(229,57,53,{ALPHA})"
