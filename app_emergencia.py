@@ -64,8 +64,8 @@ THR_MEDIO_ALTO = 0.05
 
 # ====================== Umbrales EMEAC ======================
 EMEAC_MIN_DEN = 3.0
-EMEAC_ADJ_DEN = 3.5
-EMEAC_MAX_DEN = 4.0
+EMEAC_ADJ_DEN = 4.0
+EMEAC_MAX_DEN = 5.0
 
 # ====================== Colores por nivel ======================
 COLOR_MAP = {"Bajo": "#2ca02c", "Medio": "#ff7f0e", "Alto": "#d62728"}
