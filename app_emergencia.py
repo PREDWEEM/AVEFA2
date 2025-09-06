@@ -240,7 +240,6 @@ st.title("Predicción de Emergencia Agrícola AVEFA")
 st.sidebar.header("Meteo")
 st.sidebar.caption("Histórico adjunto 01-ene-2025 → 03-sep-2025 + futuro del CSV público.")
 
-# <<< NUEVO: opción de congelar en el menú lateral >>>
 FREEZE_HISTORY = st.sidebar.checkbox(
     "Congelar histórico local (no sobrescribir)",
     value=FREEZE_HISTORY,
@@ -280,41 +279,65 @@ HIST_START = pd.Timestamp(2025, 1, 1)
 HIST_END   = pd.Timestamp(2025, 9, 3)   # inclusive
 
 def _normalize_meteo_generic(df_in: pd.DataFrame) -> pd.DataFrame:
+    if df_in is None or df_in.empty:
+        return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
+
     df = df_in.copy()
     df.columns = [str(c).strip() for c in df.columns]
     lower = {c.lower(): c for c in df.columns}
+
     def pick(*cands):
         for c in cands:
             if c in lower:
                 return lower[c]
         return None
-    mapping = {
-        (pick("fecha","date") or "Fecha"): "Fecha",
-        (pick("julian_days","julianday","julian","doy","dia_juliano") or "Julian_days"): "Julian_days",
-        (pick("tmax","t_max","tx") or "TMAX"): "TMAX",
-        (pick("tmin","t_min","tn") or "TMIN"): "TMIN",
-        (pick("prec","ppt","precip","lluvia","mm","prcp") or "Prec"): "Prec",
-    }
-    df = df.rename(columns=mapping)
+
+    c_fecha = pick("fecha","date","fech","día","dia","fch")
+    c_doy   = pick("julian_days","julianday","julian","doy","dia_juliano","diajuliano","juliano","dayofyear","día juliano","dia juliano")
+    c_tmax  = pick("tmax","t_max","tx","t máx","t max","t. max")
+    c_tmin  = pick("tmin","t_min","tn","t mín","t min","t. min")
+    c_prec  = pick("prec","ppt","precip","lluvia","mm","prcp","precipitacion","precipitación")
+
+    mapping = {}
+    if c_fecha: mapping[c_fecha] = "Fecha"
+    if c_doy:   mapping[c_doy]   = "Julian_days"
+    if c_tmax:  mapping[c_tmax]  = "TMAX"
+    if c_tmin:  mapping[c_tmin]  = "TMIN"
+    if c_prec:  mapping[c_prec]  = "Prec"
+
+    if mapping:
+        df = df.rename(columns=mapping)
+
     if "Fecha" in df.columns:
         df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
-    if "Julian_days" not in df.columns and "Fecha" in df.columns:
-        df["Julian_days"] = pd.to_datetime(df["Fecha"]).dt.dayofyear
+
     if "Fecha" not in df.columns and "Julian_days" in df.columns:
-        df["Fecha"] = pd.to_datetime("2025-01-01") + pd.to_timedelta(
-            pd.to_numeric(df["Julian_days"], errors="coerce") - 1, unit="D"
-        )
+        df["Julian_days"] = pd.to_numeric(df["Julian_days"], errors="coerce")
+        df["Fecha"] = pd.to_datetime("2025-01-01") + pd.to_timedelta(df["Julian_days"] - 1, unit="D")
+
+    if "Julian_days" not in df.columns and "Fecha" in df.columns:
+        df["Julian_days"] = pd.to_datetime(df["Fecha"], errors="coerce").dt.dayofyear
+
+    if "Fecha" not in df.columns:
+        return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
+
     for c in ["Julian_days","TMAX","TMIN","Prec"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
-    df["Julian_days"] = df["Fecha"].dt.dayofyear
+
+    df = df.loc[df["Fecha"].notna()].sort_values("Fecha").reset_index(drop=True)
+    df["Julian_days"] = pd.to_datetime(df["Fecha"]).dt.dayofyear
     if "Prec" in df.columns:
         df["Prec"] = df["Prec"].clip(lower=0)
     if {"TMAX","TMIN"}.issubset(df.columns):
         m = df["TMAX"] < df["TMIN"]
         if m.any():
             df.loc[m, ["TMAX","TMIN"]] = df.loc[m, ["TMIN","TMAX"]].values
+
+    for need in ["TMAX","TMIN","Prec"]:
+        if need not in df.columns:
+            df[need] = np.nan
+
     return df[["Fecha","Julian_days","TMAX","TMIN","Prec"]]
 
 def _load_attached_history() -> pd.DataFrame:
@@ -322,37 +345,56 @@ def _load_attached_history() -> pd.DataFrame:
         "Subí el HISTÓRICO (CSV/XLSX) para 2025-01-01 → 2025-09-03",
         type=["csv","xlsx"], accept_multiple_files=False, key="hist_attach"
     )
-    df_hist = pd.DataFrame()
+    df_hist_raw = pd.DataFrame()
+
+    # 1) Preferir upload (leer separado por ';' porque tu archivo viene así)
     if up is not None:
         try:
             if up.name.lower().endswith(".xlsx"):
-                df_hist = pd.read_excel(up)
+                df_hist_raw = pd.read_excel(up)
             else:
-                df_hist = pd.read_csv(up)
-        except Exception:
-            st.error("No se pudo leer el archivo adjunto. Verificá formato/columnas.")
-            df_hist = pd.DataFrame()
+                # lector robusto: primero ';', si falla probamos coma
+                try:
+                    df_hist_raw = pd.read_csv(up, sep=";")
+                except Exception:
+                    up.seek(0)
+                    df_hist_raw = pd.read_csv(up)
+        except Exception as e:
+            st.error(f"No se pudo leer el archivo adjunto ({e}). Verificá formato/columnas.")
+            return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
     else:
+        # 2) Ruta conocida en /mnt/data (también con ';')
         try:
             p = Path("/mnt/data/BORDE2025.csv")
             if p.exists():
-                df_hist = pd.read_csv(p)
-        except Exception:
-            pass
+                try:
+                    df_hist_raw = pd.read_csv(p, sep=";")
+                except Exception:
+                    df_hist_raw = pd.read_csv(p)
+        except Exception as e:
+            st.warning(f"No se pudo leer /mnt/data/BORDE2025.csv ({e}).")
+            return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
 
-    if df_hist.empty:
+    if df_hist_raw.empty:
         st.warning("No se detectó histórico adjunto; se continuará solo con el CSV público.")
-        return df_hist
+        return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
 
-    df_hist = _normalize_meteo_generic(df_hist)
+    df_hist = _normalize_meteo_generic(df_hist_raw)
+
+    if "Fecha" not in df_hist.columns or df_hist.empty:
+        st.error(
+            "El histórico adjunto no contiene columnas reconocibles para 'Fecha' ni 'Julian_days'. "
+            "Encabezados detectados: " + ", ".join(map(str, df_hist_raw.columns))
+        )
+        return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
+
     m = (df_hist["Fecha"] >= HIST_START) & (df_hist["Fecha"] <= HIST_END)
     df_hist = df_hist.loc[m].copy().reset_index(drop=True)
 
     if df_hist.empty:
         st.error("El histórico adjunto no tiene filas dentro de 2025-01-01 → 2025-09-03.")
-        return df_hist
+        return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
 
-    # Interpolación si hay NaN
     faltantes = [c for c in ["Julian_days","TMAX","TMIN","Prec"] if df_hist[c].isna().any()]
     if faltantes:
         st.warning(f"El histórico adjunto tiene NaN en: {', '.join(faltantes)}. Se interpolará.")
@@ -360,8 +402,10 @@ def _load_attached_history() -> pd.DataFrame:
             limit_direction="both"
         )
 
-    st.success(f"Histórico adjunto OK: {df_hist['Fecha'].min().date()} → {df_hist['Fecha'].max().date()} "
-               f"({len(df_hist)} filas)")
+    st.success(
+        f"Histórico adjunto OK: {df_hist['Fecha'].min().date()} → {df_hist['Fecha'].max().date()} "
+        f"({len(df_hist)} filas)."
+    )
     return df_hist
 
 def _leer_public_csv_solo_futuro():
@@ -417,7 +461,6 @@ for nombre, df in dfs:
         continue
 
     df = df.sort_values("Julian_days").reset_index(drop=True)
-    # Asegurar 'Fecha'
     if "Fecha" not in df.columns or not np.issubdtype(df["Fecha"].dtype, np.datetime64):
         year = pd.Timestamp.now().year
         df["Fecha"] = pd.to_datetime(f"{year}-01-01") + pd.to_timedelta(df["Julian_days"] - 1, unit="D")
@@ -437,7 +480,6 @@ for nombre, df in dfs:
     for col in ["EMEAC (0-1) - mínimo", "EMEAC (0-1) - máximo", "EMEAC (0-1) - ajustable"]:
         pred[col.replace("(0-1)", "(%)")] = (pred[col] * 100).clip(0, 100)
 
-    # ---- Ventana 1/feb → 1/nov para gráficos (con fallback) ----
     years = pred["Fecha"].dt.year.unique()
     yr = int(years[0]) if len(years) == 1 else int(st.sidebar.selectbox("Año (reinicio 1/feb → 1/nov)", sorted(years), key=f"year_select_{nombre}"))
     fi = pd.Timestamp(year=yr, month=2, day=1)
