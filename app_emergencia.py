@@ -1,8 +1,9 @@
-# app_emergencia.py — AVEFA (empalme estricto, horizonte dinámico, soporte date/jd)
-# - Histórico: BORDE2025.csv (hasta 2025-09-03 inclusive)
-# - Futuro: meteo_history.csv (desde 2025-09-04 hasta SU última fecha disponible)
-# - Sin calendarizar ni interpolar días faltantes
+# app_emergencia.py — AVEFA (empalme estricto usando JD, sin calendarizar)
+# - Histórico: BORDE2025.csv (hasta 2025-09-03 inclusive, desde GitHub)
+# - Futuro: meteo_history.csv (desde 2025-09-04 hasta su última fecha real; usa JD como verdad)
+# - Sin calendarización ni interpolación de días faltantes
 # - La red se alimenta SOLO con los días presentes
+# - Diagnóstico claro de primer/último día y huecos
 
 import streamlit as st
 import numpy as np
@@ -118,16 +119,11 @@ THR_MEDIO_ALTO = 0.05
 EMEAC_MIN_DEN, EMEAC_ADJ_DEN, EMEAC_MAX_DEN = 3.0, 4.0, 5.0
 HIST_START = pd.Timestamp(2025, 1, 1)
 HIST_END   = pd.Timestamp(2025, 9, 3)  # inclusive
-
 COLOR_MAP = {"Bajo": "#00A651", "Medio": "#FFC000", "Alto": "#E53935"}
 
-# =================== NORMALIZACIÓN (sin crear días) ===================
+# =================== NORMALIZACIÓN GENÉRICA (para BORDE) ===================
 def _sanitize_meteo_nointerp(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Sanea tipos y nombres de columnas; NO calendariza ni rellena.
-    Acepta alias: Fecha/date, Julian_days/julianday/doy/dia_juliano/dayofyear/juliano/jd,
-    TMAX/tmax, TMIN/tmin, Prec/prec/prcp/lluvia/mm/ppt.
-    """
+    """Sanea tipos; NO calendariza ni rellena. Corrige Tmin/Tmax y clip de Prec."""
     if df is None or df.empty:
         return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
     df = df.copy()
@@ -141,46 +137,104 @@ def _sanitize_meteo_nointerp(df: pd.DataFrame) -> pd.DataFrame:
 
     mapping = {}
     c_fecha = pick("fecha","date")
-    c_doy   = pick("julian_days","julianday","doy","dia_juliano","dayofyear","juliano","jd")  # <-- incluye jd
+    c_doy   = pick("julian_days","julianday","doy","dia_juliano","dayofyear","juliano","jd")
     c_tmax  = pick("tmax","t_max","tx")
     c_tmin  = pick("tmin","t_min","tn")
     c_prec  = pick("prec","ppt","precip","lluvia","prcp","mm")
-
     if c_fecha: mapping[c_fecha] = "Fecha"
     if c_doy:   mapping[c_doy]   = "Julian_days"
     if c_tmax:  mapping[c_tmax]  = "TMAX"
     if c_tmin:  mapping[c_tmin]  = "TMIN"
     if c_prec:  mapping[c_prec]  = "Prec"
-
     if mapping: df = df.rename(columns=mapping)
 
-    # Fecha ↔ DOY
+    # Fecha/DOY
     if "Fecha" in df.columns:
-        df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce", dayfirst=True)
+        # elegir parse que mejor encaje 2025
+        d1 = pd.to_datetime(df["Fecha"], errors="coerce", dayfirst=True)
+        d2 = pd.to_datetime(df["Fecha"], errors="coerce", dayfirst=False)
+        c1 = d1.where(d1.dt.year==2025).max()
+        c2 = d2.where(d2.dt.year==2025).max()
+        use_dayfirst = bool(pd.notna(c1) and (pd.isna(c2) or c1 >= c2))
+        df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce", dayfirst=use_dayfirst)
     if "Julian_days" in df.columns:
         df["Julian_days"] = pd.to_numeric(df["Julian_days"], errors="coerce")
 
-    if ("Fecha" not in df.columns) and ("Julian_days" in df.columns):
+    if "Fecha" not in df.columns and "Julian_days" in df.columns:
         df["Fecha"] = pd.to_datetime("2025-01-01") + pd.to_timedelta(df["Julian_days"] - 1, unit="D")
-    if ("Julian_days" not in df.columns) and ("Fecha" in df.columns):
+    if "Julian_days" not in df.columns and "Fecha" in df.columns:
         df["Julian_days"] = pd.to_datetime(df["Fecha"]).dt.dayofyear
 
-    # Tipos y saneo básico
     for c in ["TMAX","TMIN","Prec"]:
         if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
+
     df = df.dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
 
-    # Correcciones físicas mínimas
     if "Prec" in df.columns: df["Prec"] = df["Prec"].clip(lower=0)
     if {"TMAX","TMIN"}.issubset(df.columns):
         m = df["TMAX"] < df["TMIN"]
         if m.any(): df.loc[m, ["TMAX","TMIN"]] = df.loc[m, ["TMIN","TMAX"]].values
 
-    # Recalcular DOY inválido
-    bad = df["Julian_days"].isna() | (df["Julian_days"] < 1) | (df["Julian_days"] > 366)
-    if bad.any():
-        df.loc[bad, "Julian_days"] = pd.to_datetime(df.loc[bad, "Fecha"]).dt.dayofyear
+    if "Julian_days" in df.columns:
+        bad = df["Julian_days"].isna() | (df["Julian_days"] < 1) | (df["Julian_days"] > 366)
+        if bad.any(): df.loc[bad, "Julian_days"] = df.loc[bad, "Fecha"].dt.dayofyear
+    else:
+        df["Julian_days"] = df["Fecha"].dt.dayofyear
 
+    return df[["Fecha","Julian_days","TMAX","TMIN","Prec"]]
+
+# =================== NORMALIZACIÓN ESTRICTA (para meteo_history.csv) ===================
+def _sanitize_mh_strict(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Sanitizador ESTRICTO para meteo_history.csv:
+    - Usa jd/Julian_days como fuente de verdad para construir Fecha (ignora strings ambiguos).
+    - No calendariza ni rellena. Corrige Tmin/Tmax y clip de Prec.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
+
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    lower = {c.lower(): c for c in df.columns}
+
+    def pick(*cands):
+        for c in cands:
+            if c in lower: return lower[c]
+        return None
+
+    c_jd   = pick("julian_days","julianday","doy","dia_juliano","dayofyear","juliano","jd")
+    c_tmax = pick("tmax","t_max","tx")
+    c_tmin = pick("tmin","t_min","tn")
+    c_prec = pick("prec","ppt","precip","lluvia","prcp","mm")
+
+    mapping = {}
+    if c_jd:   mapping[c_jd]   = "Julian_days"
+    if c_tmax: mapping[c_tmax] = "TMAX"
+    if c_tmin: mapping[c_tmin] = "TMIN"
+    if c_prec: mapping[c_prec] = "Prec"
+    if mapping: df = df.rename(columns=mapping)
+
+    if "Julian_days" not in df.columns:
+        # Recurso mínimo si falta jd (no debería ocurrir)
+        c_date = pick("fecha","date")
+        if c_date:
+            d = pd.to_datetime(df[c_date], errors="coerce", dayfirst=True)
+            df["Julian_days"] = d.dt.dayofyear
+        else:
+            return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
+
+    df["Julian_days"] = pd.to_numeric(df["Julian_days"], errors="coerce")
+    df["Fecha"] = pd.to_datetime("2025-01-01") + pd.to_timedelta(df["Julian_days"] - 1, unit="D")
+
+    for c in ["TMAX","TMIN","Prec"]:
+        if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    if "Prec" in df.columns: df["Prec"] = df["Prec"].clip(lower=0)
+    if {"TMAX","TMIN"}.issubset(df.columns):
+        m = df["TMAX"] < df["TMIN"]
+        if m.any(): df.loc[m, ["TMAX","TMIN"]] = df.loc[m, ["TMIN","TMAX"]].values
+
+    df = df.dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
     return df[["Fecha","Julian_days","TMAX","TMIN","Prec"]]
 
 # =================== CARGA BORDE2025 (GitHub) ===================
@@ -218,7 +272,7 @@ def _load_borde_hist() -> pd.DataFrame:
     df = _sanitize_meteo_nointerp(df_raw)
     return df[(df["Fecha"] >= HIST_START) & (df["Fecha"] <= HIST_END)].copy()
 
-# =================== CARGA meteo_history (futuro, horizonte dinámico) ===================
+# =================== CARGA meteo_history (usa _sanitize_mh_strict) ===================
 @st.cache_data(ttl=900)
 def load_meteo_history_csv(url_override: str = "") -> pd.DataFrame:
     urls: List[str] = []
@@ -237,7 +291,7 @@ def load_meteo_history_csv(url_override: str = "") -> pd.DataFrame:
                         dict(sep=",", decimal=".", encoding="utf-8-sig")]:
                 try:
                     df0 = pd.read_csv(BytesIO(raw), engine="python", **opt)
-                    df1 = _sanitize_meteo_nointerp(df0)
+                    df1 = _sanitize_mh_strict(df0)   # <- usa JD como verdad
                     if not df1.empty: return df1, url
                 except Exception as e:
                     last_err = e; continue
@@ -251,12 +305,12 @@ def load_meteo_history_csv(url_override: str = "") -> pd.DataFrame:
                 df0 = pd.read_csv(p, sep=";", decimal=",", engine="python", encoding="utf-8-sig")
             except Exception:
                 df0 = pd.read_csv(p, engine="python", encoding="utf-8-sig")
-            return _sanitize_meteo_nointerp(df0), str(p)
+            return _sanitize_mh_strict(df0), str(p)
     except Exception as e:
         last_err = e
     raise RuntimeError(f"No se pudo cargar meteo_history.csv (último error: {last_err})")
 
-# =================== EMPALME ESTRICTO (hasta la última fecha del pronóstico) ===================
+# =================== EMPALME ESTRICTO ===================
 def construir_empalme(url_override: str = "") -> pd.DataFrame:
     # 1) Histórico: 01-ene → 03-sep (incl.)
     df_hist = _load_borde_hist()
@@ -270,25 +324,27 @@ def construir_empalme(url_override: str = "") -> pd.DataFrame:
         st.warning(str(e))
         df_mh = pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
 
-    if not df_mh.empty:
-        # solo 04-sep en adelante
-        df_mh = df_mh[df_mh["Fecha"] >= (HIST_END + pd.Timedelta(days=1))].copy()
-        # último día realmente presente en meteo_history.csv
-        end_date = df_mh["Fecha"].max()
-        # por las dudas, nada posterior al último día detectado
-        df_mh = df_mh[df_mh["Fecha"] <= end_date].copy()
-    else:
-        end_date = HIST_END
+    # Solo 04-sep en adelante
+    df_mh = df_mh[df_mh["Fecha"] >= (HIST_END + pd.Timedelta(days=1))].copy()
 
-    # 3) Unir y limitar rango final
+    # end_date: último día realmente presente (si no hay futuro, queda HIST_END)
+    end_date = df_mh["Fecha"].max() if not df_mh.empty else HIST_END
+    if pd.isna(end_date):
+        end_date = HIST_END  # blindaje
+
+    # Cortar cualquier cosa posterior a end_date
+    if not df_mh.empty:
+        df_mh = df_mh[df_mh["Fecha"] <= end_date].copy()
+
+    # 3) Unir y limitar a [HIST_START, end_date]
     df_emp = pd.concat([df_hist, df_mh], ignore_index=True)
     if not df_emp.empty:
         df_emp = df_emp[(df_emp["Fecha"] >= HIST_START) & (df_emp["Fecha"] <= end_date)].copy()
         df_emp = df_emp.dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
 
-    # 4) Diagnóstico: huecos informativos en el tramo futuro (no se rellenan)
+    # 4) Diagnóstico
     if df_mh.empty:
-        st.info("No hay datos de meteo_history.csv; el empalme queda en 2025-09-03.")
+        st.info("No hay días en meteo_history.csv posteriores al 2025-09-03; el empalme queda en 2025-09-03.")
     else:
         st.info(
             f"Empalme: {df_emp['Fecha'].min().date()} → {df_emp['Fecha'].max().date()} "
@@ -331,18 +387,17 @@ if modelo is None: st.stop()
 
 # =================== CONSTRUIR EMPALME Y DIAGNÓSTICO ===================
 df_empalmado = construir_empalme(meteo_history_url_override)
-
 if df_empalmado.empty:
-    st.error("No hay datos tras el empalme (¿falta histórico o futuro?)."); st.stop()
+    st.error("No hay datos tras el empalme (¿falta histórico o futuro?).")
+    st.stop()
 
-# Diagnóstico rápido (evita metric() con datetime)
 with st.expander("🔎 Diagnóstico del empalme (histórico + futuro)"):
-    hist_last = df_empalmado.loc[df_empalmado["Fecha"] <= HIST_END, "Fecha"].max()
-    fut_min   = df_empalmado.loc[df_empalmado["Fecha"] > HIST_END, "Fecha"].min() if (df_empalmado["Fecha"] > HIST_END).any() else pd.NaT
     def _fmt(x):
-        try:
-            return pd.to_datetime(x).strftime("%Y-%m-%d") if pd.notna(x) else "—"
+        try: return pd.to_datetime(x).strftime("%Y-%m-%d") if pd.notna(x) else "—"
         except Exception: return "—"
+    hist_last = df_empalmado.loc[df_empalmado["Fecha"] <= HIST_END, "Fecha"].max()
+    fut_mask  = df_empalmado["Fecha"] > HIST_END
+    fut_min   = df_empalmado.loc[fut_mask, "Fecha"].min() if fut_mask.any() else pd.NaT
     st.write("Último histórico:", _fmt(hist_last))
     st.write("Primer futuro:", _fmt(fut_min))
     st.write("Última fecha del empalme:", _fmt(df_empalmado["Fecha"].max()))
@@ -464,3 +519,4 @@ st.download_button(
     data=buf.getvalue(), file_name=f"AVEFA_resultados_{'todo' if rango_opcion=='Todo el empalme' else 'rango'}.csv",
     mime="text/csv"
 )
+
