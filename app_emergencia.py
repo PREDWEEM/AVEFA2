@@ -1,8 +1,8 @@
 # app_emergencia.py — AVEFA (empalme estricto y horizonte dinámico)
 # - Histórico: BORDE2025.csv (hasta 2025-09-03 inclusive)
 # - Futuro: meteo_history.csv (desde 2025-09-04 en adelante, hasta SU última fecha disponible)
-# - Sin calendarización ni interpolación de días faltantes
-# - La red neuronal se alimenta SOLO con los días presentes
+# - SIN calendarizar ni interpolar días faltantes
+# - La red se alimenta SOLO con los días presentes (no genera nada posterior)
 
 import streamlit as st
 import numpy as np
@@ -30,7 +30,7 @@ st.markdown(
 )
 
 # =================== HELPERS ===================
-def safe_run(fn: Callable[[], any], user_msg: str):
+def safe_run(fn: Callable[[], Any], user_msg: str):
     try:
         return fn()
     except Exception:
@@ -248,7 +248,11 @@ def load_meteo_history_csv(url_override: str = "") -> pd.DataFrame:
 
 # =================== EMPALME ESTRICTO (hasta la última fecha del pronóstico) ===================
 def construir_empalme(url_override: str = "") -> pd.DataFrame:
-    df_hist = _load_borde_hist()  # 01-ene → 03-sep (incl)
+    # 1) Histórico: 01-ene → 03-sep (incl.)
+    df_hist = _load_borde_hist()
+    df_hist = df_hist[df_hist["Fecha"] <= HIST_END].copy()
+
+    # 2) Futuro desde meteo_history.csv (sin crear días)
     try:
         df_mh, used = load_meteo_history_csv(url_override)
         st.success(f"meteo_history.csv cargado desde: {used}")
@@ -256,35 +260,38 @@ def construir_empalme(url_override: str = "") -> pd.DataFrame:
         st.warning(str(e))
         df_mh = pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
 
-    # filtros estrictos
-    df_hist = df_hist[df_hist["Fecha"] <= HIST_END].copy()
-    df_mh   = df_mh[df_mh["Fecha"] >= (HIST_END + pd.Timedelta(days=1))].copy()  # 04-sep en adelante
+    if not df_mh.empty:
+        # solo 04-sep en adelante
+        df_mh = df_mh[df_mh["Fecha"] >= (HIST_END + pd.Timedelta(days=1))].copy()
+        # último día realmente presente
+        last_mh = df_mh["Fecha"].max()
+        end_date = last_mh
+        # por las dudas, nada posterior al último día detectado
+        df_mh = df_mh[df_mh["Fecha"] <= end_date].copy()
+    else:
+        end_date = HIST_END
 
-    # Cortar en el último día efectivamente disponible del futuro
-    end_date = df_mh["Fecha"].max() if not df_mh.empty else HIST_END
-
+    # 3) Unir y limitar rango final
     df_emp = pd.concat([df_hist, df_mh], ignore_index=True)
     if not df_emp.empty:
         df_emp = df_emp[(df_emp["Fecha"] >= HIST_START) & (df_emp["Fecha"] <= end_date)].copy()
         df_emp = df_emp.dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
 
-    # Diagnóstico
+    # 4) Diagnóstico: huecos informativos en el tramo futuro (no se rellenan)
     if df_mh.empty:
         st.info("No hay datos de meteo_history.csv; el empalme queda en 2025-09-03.")
     else:
         st.info(
             f"Empalme: {df_emp['Fecha'].min().date()} → {df_emp['Fecha'].max().date()} "
-            f"({len(df_emp)} fila(s))."
+            f"({len(df_emp)} fila(s)). Último día leído en meteo_history.csv = {end_date.date()}."
         )
-        cal_start = df_mh["Fecha"].min()
-        cal_end   = df_mh["Fecha"].max()
-        if cal_start <= cal_end:
-            cal = pd.date_range(cal_start, cal_end, freq="D")
-            present = set(pd.to_datetime(df_mh["Fecha"]).dt.normalize().tolist())
-            missing = [d for d in cal if d not in present]
-            if missing:
-                st.warning("Faltan días en meteo_history.csv (no se rellenan): " +
-                           ", ".join(pd.DatetimeIndex(missing).strftime("%d-%m").tolist()))
+        cal = pd.date_range(df_mh["Fecha"].min(), df_mh["Fecha"].max(), freq="D")
+        present = set(pd.to_datetime(df_mh["Fecha"]).dt.normalize().tolist())
+        missing = [d for d in cal if d not in present]
+        if missing:
+            st.warning("Faltan días en meteo_history.csv (no se rellenan): " +
+                       ", ".join(pd.DatetimeIndex(missing).strftime("%d-%m").tolist()))
+
     return df_emp
 
 # =================== SIDEBAR ===================
@@ -388,6 +395,12 @@ x = pred_vis["Fecha"]; ma = pred_vis["EMERREL_MA5"].clip(lower=0)
 thr_low, thr_med = float(THR_BAJO_MEDIO), float(THR_MEDIO_ALTO)
 y0 = np.zeros(len(ma)); y1 = np.minimum(ma, thr_low); y2 = np.minimum(ma, thr_med); y3 = ma
 
+# relleno tricolor interno bajo MA5
+ALPHA = st.sidebar.session_state.get("alpha_fill", None) or st.session_state.get("alpha_fill", None)
+# si no está guardado el slider, tomamos el valor actual:
+if ALPHA is None:
+    ALPHA = st.session_state.get("alpha_fill_runtime", 0.70)
+st.session_state["alpha_fill_runtime"] = ALPHA
 GREEN_RGBA  = f"rgba(0,166,81,{ALPHA})"
 YELLOW_RGBA = f"rgba(255,192,0,{ALPHA})"
 RED_RGBA    = f"rgba(229,57,53,{ALPHA})"
