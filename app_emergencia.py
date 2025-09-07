@@ -116,9 +116,7 @@ def _sanitize_meteo(df: pd.DataFrame) -> pd.DataFrame:
 HIST_CSV_URL_SECRET = st.secrets.get("HIST_CSV_URL", "").strip()
 HIST_CSV_URLS: List[str] = [
     "https://raw.githubusercontent.com/PREDWEEM/AVEFA2/main/BORDE2025.csv",
-    "https://raw.githubusercontent.com/PREDWEEM/ANN/gh-pages/BORDE2025.csv",
-    "https://PREDWEEM.github.io/ANN/BORDE2025.csv",
-]
+    ]
 
 def _try_read_csv_semicolon_first(url: str) -> pd.DataFrame:
     raw = _fetch_bytes(url)
@@ -214,8 +212,7 @@ def load_meteo_history_csv(maybe_url_override: str = ""):
         urls.append(maybe_url_override.strip())
     urls.extend([
         "https://github.com/PREDWEEM/AVEFA2/blob/main/meteo_history.csv",
-        
-    ])
+            ])
 
     last_err = None
     for url in urls:
