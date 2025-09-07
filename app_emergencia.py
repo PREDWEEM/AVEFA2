@@ -1,8 +1,8 @@
-# app_emergencia.py — AVEFA (empalme estricto y horizonte dinámico)
+# app_emergencia.py — AVEFA (empalme estricto, horizonte dinámico, soporte date/jd)
 # - Histórico: BORDE2025.csv (hasta 2025-09-03 inclusive)
-# - Futuro: meteo_history.csv (desde 2025-09-04 en adelante, hasta SU última fecha disponible)
-# - SIN calendarizar ni interpolar días faltantes
-# - La red se alimenta SOLO con los días presentes (no genera nada posterior)
+# - Futuro: meteo_history.csv (desde 2025-09-04 hasta SU última fecha disponible)
+# - Sin calendarizar ni interpolar días faltantes
+# - La red se alimenta SOLO con los días presentes
 
 import streamlit as st
 import numpy as np
@@ -78,7 +78,7 @@ class PracticalANNModel:
     def __init__(self, IW, bias_IW, LW, bias_out):
         self.IW, self.bias_IW, self.LW = IW, bias_IW, LW
         self.bias_out = float(bias_out)
-        # Orden: [Julian_days, TMIN, TMAX, Prec]
+        # Orden de entrada: [Julian_days, TMIN, TMAX, Prec]
         self.input_min = np.array([1, -7, 0, 0], dtype=float)
         self.input_max = np.array([300, 25.5, 41, 84], dtype=float)
         self._den = np.maximum(self.input_max - self.input_min, 1e-9)
@@ -123,53 +123,63 @@ COLOR_MAP = {"Bajo": "#00A651", "Medio": "#FFC000", "Alto": "#E53935"}
 
 # =================== NORMALIZACIÓN (sin crear días) ===================
 def _sanitize_meteo_nointerp(df: pd.DataFrame) -> pd.DataFrame:
-    """Sanea tipos; NO calendariza ni rellena. Corrige Tmin/Tmax y clip de Prec."""
+    """
+    Sanea tipos y nombres de columnas; NO calendariza ni rellena.
+    Acepta alias: Fecha/date, Julian_days/julianday/doy/dia_juliano/dayofyear/juliano/jd,
+    TMAX/tmax, TMIN/tmin, Prec/prec/prcp/lluvia/mm/ppt.
+    """
     if df is None or df.empty:
         return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
-    # Renombrado flexible
     lower = {c.lower(): c for c in df.columns}
+
     def pick(*cands):
         for c in cands:
             if c in lower: return lower[c]
         return None
+
     mapping = {}
-    c_fecha = pick("fecha","date"); c_doy = pick("julian_days","julianday","doy","dia_juliano","dayofyear","juliano")
-    c_tmax  = pick("tmax","t_max","tx"); c_tmin = pick("tmin","t_min","tn"); c_prec = pick("prec","ppt","precip","lluvia","prcp","mm")
+    c_fecha = pick("fecha","date")
+    c_doy   = pick("julian_days","julianday","doy","dia_juliano","dayofyear","juliano","jd")  # <-- incluye jd
+    c_tmax  = pick("tmax","t_max","tx")
+    c_tmin  = pick("tmin","t_min","tn")
+    c_prec  = pick("prec","ppt","precip","lluvia","prcp","mm")
+
     if c_fecha: mapping[c_fecha] = "Fecha"
     if c_doy:   mapping[c_doy]   = "Julian_days"
     if c_tmax:  mapping[c_tmax]  = "TMAX"
     if c_tmin:  mapping[c_tmin]  = "TMIN"
     if c_prec:  mapping[c_prec]  = "Prec"
+
     if mapping: df = df.rename(columns=mapping)
 
+    # Fecha ↔ DOY
     if "Fecha" in df.columns:
         df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce", dayfirst=True)
-    elif "Julian_days" in df.columns:
+    if "Julian_days" in df.columns:
         df["Julian_days"] = pd.to_numeric(df["Julian_days"], errors="coerce")
-        df["Fecha"] = pd.to_datetime("2025-01-01") + pd.to_timedelta(df["Julian_days"] - 1, unit="D")
-    else:
-        return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
 
-    # Tipos
-    for c in ["Julian_days","TMAX","TMIN","Prec"]:
+    if ("Fecha" not in df.columns) and ("Julian_days" in df.columns):
+        df["Fecha"] = pd.to_datetime("2025-01-01") + pd.to_timedelta(df["Julian_days"] - 1, unit="D")
+    if ("Julian_days" not in df.columns) and ("Fecha" in df.columns):
+        df["Julian_days"] = pd.to_datetime(df["Fecha"]).dt.dayofyear
+
+    # Tipos y saneo básico
+    for c in ["TMAX","TMIN","Prec"]:
         if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
 
-    # Corrige Tmax/Tmin y precipitación
+    # Correcciones físicas mínimas
     if "Prec" in df.columns: df["Prec"] = df["Prec"].clip(lower=0)
     if {"TMAX","TMIN"}.issubset(df.columns):
         m = df["TMAX"] < df["TMIN"]
         if m.any(): df.loc[m, ["TMAX","TMIN"]] = df.loc[m, ["TMIN","TMAX"]].values
 
-    # DOY desde fecha si falta o está mal
-    if "Julian_days" not in df.columns:
-        df["Julian_days"] = df["Fecha"].dt.dayofyear
-    else:
-        df["Julian_days"] = pd.to_numeric(df["Julian_days"], errors="coerce")
-        bad = df["Julian_days"].isna() | (df["Julian_days"] < 1) | (df["Julian_days"] > 366)
-        df.loc[bad, "Julian_days"] = df.loc[bad, "Fecha"].dt.dayofyear
+    # Recalcular DOY inválido
+    bad = df["Julian_days"].isna() | (df["Julian_days"] < 1) | (df["Julian_days"] > 366)
+    if bad.any():
+        df.loc[bad, "Julian_days"] = pd.to_datetime(df.loc[bad, "Fecha"]).dt.dayofyear
 
     return df[["Fecha","Julian_days","TMAX","TMIN","Prec"]]
 
@@ -263,9 +273,8 @@ def construir_empalme(url_override: str = "") -> pd.DataFrame:
     if not df_mh.empty:
         # solo 04-sep en adelante
         df_mh = df_mh[df_mh["Fecha"] >= (HIST_END + pd.Timedelta(days=1))].copy()
-        # último día realmente presente
-        last_mh = df_mh["Fecha"].max()
-        end_date = last_mh
+        # último día realmente presente en meteo_history.csv
+        end_date = df_mh["Fecha"].max()
         # por las dudas, nada posterior al último día detectado
         df_mh = df_mh[df_mh["Fecha"] <= end_date].copy()
     else:
@@ -326,7 +335,7 @@ df_empalmado = construir_empalme(meteo_history_url_override)
 if df_empalmado.empty:
     st.error("No hay datos tras el empalme (¿falta histórico o futuro?)."); st.stop()
 
-# Diagnóstico rápido (sin st.metric con datetime)
+# Diagnóstico rápido (evita metric() con datetime)
 with st.expander("🔎 Diagnóstico del empalme (histórico + futuro)"):
     hist_last = df_empalmado.loc[df_empalmado["Fecha"] <= HIST_END, "Fecha"].max()
     fut_min   = df_empalmado.loc[df_empalmado["Fecha"] > HIST_END, "Fecha"].min() if (df_empalmado["Fecha"] > HIST_END).any() else pd.NaT
@@ -395,12 +404,6 @@ x = pred_vis["Fecha"]; ma = pred_vis["EMERREL_MA5"].clip(lower=0)
 thr_low, thr_med = float(THR_BAJO_MEDIO), float(THR_MEDIO_ALTO)
 y0 = np.zeros(len(ma)); y1 = np.minimum(ma, thr_low); y2 = np.minimum(ma, thr_med); y3 = ma
 
-# relleno tricolor interno bajo MA5
-ALPHA = st.sidebar.session_state.get("alpha_fill", None) or st.session_state.get("alpha_fill", None)
-# si no está guardado el slider, tomamos el valor actual:
-if ALPHA is None:
-    ALPHA = st.session_state.get("alpha_fill_runtime", 0.70)
-st.session_state["alpha_fill_runtime"] = ALPHA
 GREEN_RGBA  = f"rgba(0,166,81,{ALPHA})"
 YELLOW_RGBA = f"rgba(255,192,0,{ALPHA})"
 RED_RGBA    = f"rgba(229,57,53,{ALPHA})"
@@ -461,4 +464,3 @@ st.download_button(
     data=buf.getvalue(), file_name=f"AVEFA_resultados_{'todo' if rango_opcion=='Todo el empalme' else 'rango'}.csv",
     mime="text/csv"
 )
-
