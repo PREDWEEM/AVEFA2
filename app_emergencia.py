@@ -1,7 +1,8 @@
-# app_emergencia.py — AVEFA (empalme estricto)
-# BORDE2025.csv: hasta 2025-09-03 inclusive
-# meteo_history.csv: desde 2025-09-04 en adelante
-# Alimenta la red SOLAMENTE con los días presentes (no calendariza ni interpola)
+# app_emergencia.py — AVEFA (empalme estricto y horizonte dinámico)
+# - Histórico: BORDE2025.csv (hasta 2025-09-03 inclusive)
+# - Futuro: meteo_history.csv (desde 2025-09-04 en adelante, hasta SU última fecha disponible)
+# - Sin calendarización ni interpolación de días faltantes
+# - La red neuronal se alimenta SOLO con los días presentes
 
 import streamlit as st
 import numpy as np
@@ -12,7 +13,6 @@ from urllib.error import HTTPError, URLError
 from pathlib import Path
 import plotly.graph_objects as go
 from typing import Callable, Any, List
-import hashlib
 
 # =================== CONFIG UI / LOCKDOWN ===================
 st.set_page_config(page_title="Predicción de Emergencia Agrícola AVEFA", layout="wide")
@@ -30,21 +30,26 @@ st.markdown(
 )
 
 # =================== HELPERS ===================
-def safe_run(fn: Callable[[], Any], user_msg: str):
+def safe_run(fn: Callable[[], any], user_msg: str):
     try:
         return fn()
     except Exception:
-        st.error(user_msg); return None
+        st.error(user_msg)
+        return None
 
 def _safe_rerun():
-    try: st.rerun()
+    try:
+        st.rerun()
     except Exception:
-        try: st.experimental_rerun()
-        except Exception: st.warning("No pude forzar el rerun automáticamente. Volvé a ejecutar la app.")
+        try:
+            st.experimental_rerun()
+        except Exception:
+            st.warning("No pude forzar el rerun automáticamente. Volvé a ejecutar la app.")
 
 def _to_raw_url(u: str) -> str:
     """Convierte URLs GitHub 'blob' a 'raw'. Deja intacto si ya es raw u otro host."""
-    if not isinstance(u, str) or not u: return u
+    if not isinstance(u, str) or not u:
+        return u
     u = u.strip()
     if "github.com" in u and "/blob/" in u:
         return u.replace("https://github.com/", "https://raw.githubusercontent.com/").replace("/blob/", "/")
@@ -115,7 +120,6 @@ HIST_START = pd.Timestamp(2025, 1, 1)
 HIST_END   = pd.Timestamp(2025, 9, 3)  # inclusive
 
 COLOR_MAP = {"Bajo": "#00A651", "Medio": "#FFC000", "Alto": "#E53935"}
-COLOR_FALLBACK = "#808080"
 
 # =================== NORMALIZACIÓN (sin crear días) ===================
 def _sanitize_meteo_nointerp(df: pd.DataFrame) -> pd.DataFrame:
@@ -204,7 +208,7 @@ def _load_borde_hist() -> pd.DataFrame:
     df = _sanitize_meteo_nointerp(df_raw)
     return df[(df["Fecha"] >= HIST_START) & (df["Fecha"] <= HIST_END)].copy()
 
-# =================== CARGA meteo_history (futuro) ===================
+# =================== CARGA meteo_history (futuro, horizonte dinámico) ===================
 @st.cache_data(ttl=900)
 def load_meteo_history_csv(url_override: str = "") -> pd.DataFrame:
     urls: List[str] = []
@@ -242,7 +246,7 @@ def load_meteo_history_csv(url_override: str = "") -> pd.DataFrame:
         last_err = e
     raise RuntimeError(f"No se pudo cargar meteo_history.csv (último error: {last_err})")
 
-# =================== EMPALME ESTRICTO ===================
+# =================== EMPALME ESTRICTO (hasta la última fecha del pronóstico) ===================
 def construir_empalme(url_override: str = "") -> pd.DataFrame:
     df_hist = _load_borde_hist()  # 01-ene → 03-sep (incl)
     try:
@@ -254,7 +258,7 @@ def construir_empalme(url_override: str = "") -> pd.DataFrame:
 
     # filtros estrictos
     df_hist = df_hist[df_hist["Fecha"] <= HIST_END].copy()
-    df_mh   = df_mh[df_mh["Fecha"] >= (HIST_END + pd.Timedelta(days=1))].copy()  # 04-sep+
+    df_mh   = df_mh[df_mh["Fecha"] >= (HIST_END + pd.Timedelta(days=1))].copy()  # 04-sep en adelante
 
     # Cortar en el último día efectivamente disponible del futuro
     end_date = df_mh["Fecha"].max() if not df_mh.empty else HIST_END
@@ -263,6 +267,24 @@ def construir_empalme(url_override: str = "") -> pd.DataFrame:
     if not df_emp.empty:
         df_emp = df_emp[(df_emp["Fecha"] >= HIST_START) & (df_emp["Fecha"] <= end_date)].copy()
         df_emp = df_emp.dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
+
+    # Diagnóstico
+    if df_mh.empty:
+        st.info("No hay datos de meteo_history.csv; el empalme queda en 2025-09-03.")
+    else:
+        st.info(
+            f"Empalme: {df_emp['Fecha'].min().date()} → {df_emp['Fecha'].max().date()} "
+            f"({len(df_emp)} fila(s))."
+        )
+        cal_start = df_mh["Fecha"].min()
+        cal_end   = df_mh["Fecha"].max()
+        if cal_start <= cal_end:
+            cal = pd.date_range(cal_start, cal_end, freq="D")
+            present = set(pd.to_datetime(df_mh["Fecha"]).dt.normalize().tolist())
+            missing = [d for d in cal if d not in present]
+            if missing:
+                st.warning("Faltan días en meteo_history.csv (no se rellenan): " +
+                           ", ".join(pd.DatetimeIndex(missing).strftime("%d-%m").tolist()))
     return df_emp
 
 # =================== SIDEBAR ===================
@@ -297,29 +319,17 @@ df_empalmado = construir_empalme(meteo_history_url_override)
 if df_empalmado.empty:
     st.error("No hay datos tras el empalme (¿falta histórico o futuro?)."); st.stop()
 
-# Diagnóstico de empalme (no usa st.metric con datetime)
-with st.expander("🔎 Diagnóstico de empalme"):
+# Diagnóstico rápido (sin st.metric con datetime)
+with st.expander("🔎 Diagnóstico del empalme (histórico + futuro)"):
     hist_last = df_empalmado.loc[df_empalmado["Fecha"] <= HIST_END, "Fecha"].max()
     fut_min   = df_empalmado.loc[df_empalmado["Fecha"] > HIST_END, "Fecha"].min() if (df_empalmado["Fecha"] > HIST_END).any() else pd.NaT
-
     def _fmt(x):
         try:
             return pd.to_datetime(x).strftime("%Y-%m-%d") if pd.notna(x) else "—"
         except Exception: return "—"
-
     st.write("Último histórico:", _fmt(hist_last))
     st.write("Primer futuro:", _fmt(fut_min))
-
-    # Huecos SOLO en el tramo futuro (advertencia, no se rellenan)
-    if pd.notna(fut_min):
-        fut_max = df_empalmado["Fecha"].max()
-        cal = pd.date_range(fut_min, fut_max, freq="D")
-        present = set(pd.to_datetime(df_empalmado.loc[df_empalmado["Fecha"]>=fut_min, "Fecha"]).dt.normalize().tolist())
-        missing = [d for d in cal if d not in present]
-        if missing:
-            st.warning("Faltan días en meteo_history.csv: " + ", ".join(pd.DatetimeIndex(missing).strftime("%d-%m").tolist()))
-        else:
-            st.info("Tramo futuro continuo (sin días faltantes).")
+    st.write("Última fecha del empalme:", _fmt(df_empalmado["Fecha"].max()))
 
 # =================== PREDICCIÓN (sólo días presentes) ===================
 X_all = df_empalmado[["Julian_days","TMIN","TMAX","Prec"]].to_numpy(float)
@@ -358,15 +368,12 @@ else:
     rango_txt = "1/feb → 1/nov"
 
 # =================== GRÁFICOS ===================
-COLOR_MAP = {"Bajo": "#00A651", "Medio": "#FFC000", "Alto": "#E53935"}
-def _map_colors(series): return series.map(COLOR_MAP).fillna("#808080").to_numpy()
-
 st.title("Predicción de Emergencia Agrícola AVEFA")
 
 # EMERGENCIA RELATIVA DIARIA (barras + MA5 con relleno tricolor interno)
 st.subheader("EMERGENCIA RELATIVA DIARIA")
 pred_vis["EMERREL_MA5"] = pred_vis["EMERREL(0-1)"].rolling(5, min_periods=1).mean()
-colores_vis = _map_colors(pred_vis["Nivel_Emergencia_relativa"])
+colores_vis = pred_vis["Nivel_Emergencia_relativa"].map(COLOR_MAP).fillna("#808080").to_numpy()
 
 fig_er = go.Figure()
 fig_er.add_bar(
@@ -406,6 +413,11 @@ st.plotly_chart(fig_er, use_container_width=True, theme="streamlit")
 
 # EMERGENCIA ACUMULADA
 st.subheader("EMERGENCIA ACUMULADA DIARIA")
+if rango_opcion == "Todo el empalme":
+    y_min = pred_vis["EMEAC (%) - mínimo"]; y_max = pred_vis["EMEAC (%) - máximo"]; y_adj = pred_vis["EMEAC (%) - ajustable"]
+else:
+    y_min = pred_vis["EMEAC (%) - mínimo (rango)"]; y_max = pred_vis["EMEAC (%) - máximo (rango)"]; y_adj = pred_vis["EMEAC (%) - ajustable (rango)"]
+
 fig = go.Figure()
 fig.add_trace(go.Scatter(x=pred_vis["Fecha"], y=y_max, mode="lines", line=dict(width=0), name="Máximo", hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Máximo: %{y:.1f}%<extra></extra>"))
 fig.add_trace(go.Scatter(x=pred_vis["Fecha"], y=y_min, mode="lines", line=dict(width=0), fill="tonexty", name="Mínimo", hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Mínimo: %{y:.1f}%<extra></extra>"))
@@ -420,7 +432,7 @@ fig.update_xaxes(range=[fi, ff], dtick="D1" if (ff-fi).days <= 31 else "M1", tic
 st.plotly_chart(fig, use_container_width=True, theme="streamlit")
 
 # =================== TABLA & DESCARGA ===================
-st.subheader(f"Resultados ({rango_txt}) - Histórico GitHub + meteo_history.csv")
+st.subheader(f"Resultados ({'1/feb → 1/nov' if rango_opcion!='Todo el empalme' else f'{fi.date()} → {ff.date()}'}) - Histórico GitHub + meteo_history.csv")
 col_emeac = "EMEAC (%) - ajustable" if rango_opcion == "Todo el empalme" else "EMEAC (%) - ajustable (rango)"
 nivel_icono = {"Bajo":"🟢 Bajo","Medio":"🟡 Medio","Alto":"🔴 Alto"}
 tabla = pred_vis[["Fecha","Julian_days","Nivel_Emergencia_relativa",col_emeac]].copy()
