@@ -1,8 +1,7 @@
 # app_emergencia.py — AVEFA
-# Empalme: BORDE2025.csv (GitHub) + meteo_history.csv (futuro, prioridad AVEFA2/main)
-# Override de URL (convierte blob → raw), diagnóstico y fallback manual
-# MA5 con relleno tricolor interno, fix st.metric y cache/refresh
-
+# (lockdown + empalme histórico adjunto 01-ene-2025 → 03-sep-2025 + futuro público
+#  + MA5 con relleno tricolor INTERNO (verde/amarillo/rojo, con opacidad) + botón Actualizar
+#  + fix fechas dd/mm y DOY + lectura automática BORDE2025.csv desde GitHub)
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -34,7 +33,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# =================== Helpers ===================
+# =================== Utilidades ===================
 def safe_run(fn: Callable[[], Any], user_msg: str):
     try:
         return fn()
@@ -51,15 +50,6 @@ def _safe_rerun():
         except Exception:
             st.warning("No pude forzar el rerun automáticamente. Volvé a ejecutar la app.")
 
-def _to_raw_url(u: str) -> str:
-    """Convierte URLs de GitHub 'blob' a 'raw'. Deja intacto si ya es raw u otro host."""
-    if not isinstance(u, str) or not u:
-        return u
-    u = u.strip()
-    if "github.com" in u and "/blob/" in u:
-        return u.replace("https://github.com/", "https://raw.githubusercontent.com/").replace("/blob/", "/")
-    return u
-
 # ====================== Config pesos ======================
 GITHUB_BASE_URL = "https://raw.githubusercontent.com/PREDWEEM/AVEFA2/main"
 FNAME_IW   = "IW.npy"
@@ -67,17 +57,24 @@ FNAME_BIW  = "bias_IW.npy"
 FNAME_LW   = "LW.npy"
 FNAME_BOUT = "bias_out.npy"
 
-# ====================== Umbrales ======================
+# ====================== Umbrales EMERREL ======================
 THR_BAJO_MEDIO = 0.01
 THR_MEDIO_ALTO = 0.05
+
+# ====================== Umbrales EMEAC ======================
 EMEAC_MIN_DEN = 3.0
 EMEAC_ADJ_DEN = 4.0
 EMEAC_MAX_DEN = 5.0
 
-COLOR_MAP = {"Bajo": "#00A651", "Medio": "#FFC000", "Alto": "#E53935"}
+# ====================== Colores por nivel (intensos) ======================
+COLOR_MAP = {
+    "Bajo":  "#00A651",  # verde intenso
+    "Medio": "#FFC000",  # amarillo intenso
+    "Alto":  "#E53935"   # rojo intenso
+}
 COLOR_FALLBACK = "#808080"
 
-# ====================== Red/archivos ======================
+# ====================== Utilidades de red/archivos ======================
 def _fetch_bytes(url: str, timeout: int = 20) -> bytes:
     req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
@@ -93,6 +90,38 @@ def load_npy_from_fixed(filename: str) -> np.ndarray:
     url = f"{GITHUB_BASE_URL}/{filename}"
     raw = _fetch_bytes(url)
     return np.load(BytesIO(raw), allow_pickle=False)
+
+@st.cache_data(ttl=900)
+def load_public_csv():
+    urls = [
+        "https://PREDWEEM.github.io/ANN/meteo_daily.csv",
+        "https://raw.githubusercontent.com/PREDWEEM/ANN/gh-pages/meteo_daily.csv"
+    ]
+    last_err = None
+    for url in urls:
+        try:
+            raw = _fetch_bytes(url)
+            for use_sc, dec in [(True, ","), (True, "."), (False, ".")]:
+                try:
+                    bio = BytesIO(raw)
+                    if use_sc:
+                        df = pd.read_csv(bio, sep=";", decimal=dec, parse_dates=False)
+                    else:
+                        df = pd.read_csv(bio, decimal=dec, parse_dates=False)
+                    if "Fecha" in df.columns:
+                        df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce", dayfirst=True)
+                    req = {"Fecha", "Julian_days", "TMAX", "TMIN", "Prec"}
+                    if not req.issubset(df.columns):
+                        continue
+                    for c in ["Julian_days", "TMAX", "TMIN", "Prec"]:
+                        df[c] = pd.to_numeric(df[c], errors="coerce")
+                    return df.sort_values("Fecha").reset_index(drop=True)
+                except Exception:
+                    continue
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"No se pudo cargar el CSV público. Último error: {last_err}")
 
 def validar_columnas_meteo(df: pd.DataFrame):
     req = {"Julian_days", "TMAX", "TMIN", "Prec"}
@@ -115,7 +144,7 @@ def _sanitize_meteo(df: pd.DataFrame) -> pd.DataFrame:
         df.loc[m, ["TMAX", "TMIN"]] = df.loc[m, ["TMIN", "TMAX"]].values
     return df
 
-# ====================== Histórico desde GitHub ======================
+# ====================== HISTÓRICO DESDE GITHUB ======================
 HIST_CSV_URL_SECRET = st.secrets.get("HIST_CSV_URL", "").strip()
 HIST_CSV_URLS: List[str] = [
     "https://raw.githubusercontent.com/PREDWEEM/AVEFA2/main/BORDE2025.csv",
@@ -153,123 +182,7 @@ def load_borde_from_github() -> pd.DataFrame:
             continue
     raise RuntimeError(f"No pude leer BORDE2025.csv desde GitHub. Último error: {last_err}")
 
-# ====================== Normalización flexible ======================
-def _normalize_meteo_generic(df_in: pd.DataFrame) -> pd.DataFrame:
-    if df_in is None or df_in.empty:
-        return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
-    df = df_in.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    lower = {c.lower(): c for c in df.columns}
-
-    def pick(*cands):
-        for c in cands:
-            if c in lower:
-                return lower[c]
-        return None
-
-    c_fecha = pick("fecha","date","fech","día","dia","fch")
-    c_doy   = pick("julian_days","julianday","julian","doy","dia_juliano","diajuliano","juliano","dayofyear","día juliano","dia juliano")
-    c_tmax  = pick("tmax","t_max","tx","t máx","t max","t. max")
-    c_tmin  = pick("tmin","t_min","tn","t mín","t min","t. min")
-    c_prec  = pick("prec","ppt","precip","lluvia","mm","prcp","precipitacion","precipitación")
-
-    mapping = {}
-    if c_fecha: mapping[c_fecha] = "Fecha"
-    if c_doy:   mapping[c_doy]   = "Julian_days"
-    if c_tmax:  mapping[c_tmax]  = "TMAX"
-    if c_tmin:  mapping[c_tmin]  = "TMIN"
-    if c_prec:  mapping[c_prec]  = "Prec"
-    if mapping:
-        df = df.rename(columns=mapping)
-
-    if "Julian_days" in df.columns:
-        df["Julian_days"] = pd.to_numeric(df["Julian_days"], errors="coerce")
-        df["Fecha"] = pd.to_datetime("2025-01-01") + pd.to_timedelta(df["Julian_days"] - 1, unit="D")
-    elif "Fecha" in df.columns:
-        df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce", dayfirst=True)
-        df["Julian_days"] = pd.to_datetime(df["Fecha"]).dt.dayofyear
-    else:
-        return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
-
-    for c in ["TMAX","TMIN","Prec"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    if "Prec" in df.columns:
-        df["Prec"] = df["Prec"].clip(lower=0)
-    if {"TMAX","TMIN"}.issubset(df.columns):
-        m = df["TMAX"] < df["TMIN"]
-        if m.any():
-            df.loc[m, ["TMAX","TMIN"]] = df.loc[m, ["TMIN","TMAX"]].values
-
-    df = df.dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
-    for need in ["TMAX","TMIN","Prec"]:
-        if need not in df.columns:
-            df[need] = np.nan
-    return df[["Fecha","Julian_days","TMAX","TMIN","Prec"]]
-
-# ====================== LECTOR del futuro: meteo_history.csv (prioriza AVEFA2) ======================
-@st.cache_data(ttl=900)
-def load_meteo_history_csv(maybe_url_override: str = ""):
-    diag = {"ok": False, "used_url": None, "shape": None, "cols": None, "min": None, "max": None, "why": None}
-
-    urls: List[str] = []
-    if isinstance(maybe_url_override, str) and maybe_url_override.strip():
-        urls.append(_to_raw_url(maybe_url_override))
-    # Prioridad: tu repo AVEFA2/main
-    urls.append("https://raw.githubusercontent.com/PREDWEEM/AVEFA2/main/meteo_history.csv")
-    # Fallbacks extra
-    urls.extend([
-        "https://PREDWEEM.github.io/ANN/meteo_history.csv",
-        "https://raw.githubusercontent.com/PREDWEEM/ANN/gh-pages/meteo_history.csv",
-    ])
-
-    last_err = None
-    for url in urls:
-        try:
-            raw = _fetch_bytes(url)
-            attempts = [
-                dict(sep=";", decimal=",", encoding="utf-8-sig"),
-                dict(sep=";", decimal=".", encoding="utf-8-sig"),
-                dict(sep=",", decimal=".", encoding="utf-8-sig"),
-            ]
-            for opt in attempts:
-                try:
-                    bio = BytesIO(raw)
-                    df0 = pd.read_csv(bio, engine="python", **opt)
-                    if df0 is None or df0.empty:
-                        continue
-
-                    df_norm = _normalize_meteo_generic(df0)
-                    if df_norm.empty:
-                        continue
-
-                    df_norm = _sanitize_meteo(df_norm)
-                    if "Fecha" not in df_norm.columns or not np.issubdtype(df_norm["Fecha"].dtype, np.datetime64):
-                        df_norm["Fecha"] = pd.to_datetime("2025-01-01") + pd.to_timedelta(df_norm["Julian_days"] - 1, unit="D")
-                    df_norm = df_norm.dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
-
-                    diag.update({
-                        "ok": True, "used_url": url, "shape": df_norm.shape,
-                        "cols": list(df_norm.columns),
-                        "min": str(df_norm["Fecha"].min().date()) if not df_norm.empty else None,
-                        "max": str(df_norm["Fecha"].max().date()) if not df_norm.empty else None,
-                        "why": "OK"
-                    })
-                    return df_norm, diag
-                except Exception as ee:
-                    last_err = ee
-                    continue
-        except Exception as e:
-            last_err = e
-            continue
-
-    diag.update({
-        "ok": False, "used_url": None, "shape": None, "cols": None, "min": None, "max": None,
-        "why": f"Fallo al leer meteo_history.csv. Último error: {last_err!r}"
-    })
-    return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"]), diag
-
-# ====================== Persistencia local ======================
+# ====================== PERSISTENCIA LOCAL (CSV) ======================
 LOCAL_HISTORY_PATH = st.secrets.get("LOCAL_HISTORY_PATH", "avefa_history_local.csv")
 FREEZE_HISTORY = bool(st.secrets.get("FREEZE_HISTORY", False))
 
@@ -395,7 +308,7 @@ class PracticalANNModel:
 st.title("Predicción de Emergencia Agrícola AVEFA")
 
 st.sidebar.header("Meteo")
-st.sidebar.caption("Histórico BORDE2025.csv se carga automáticamente desde GitHub; futuro desde meteo_history.csv (prioridad AVEFA2/main).")
+st.sidebar.caption("Histórico BORDE2025.csv se carga automáticamente desde GitHub; futuro desde el CSV público.")
 
 if "cache_bust" not in st.session_state:
     st.session_state.cache_bust = 0
@@ -413,7 +326,7 @@ with col_b:
 
 FREEZE_HISTORY = st.sidebar.checkbox(
     "Congelar histórico local (no sobrescribir)",
-    value=bool(st.secrets.get("FREEZE_HISTORY", False)),
+    value=FREEZE_HISTORY,
     help="Si está activado, al guardar el histórico local se conservan los valores ya guardados para cada fecha."
 )
 
@@ -423,13 +336,6 @@ rango_opcion = st.sidebar.radio(
     ["1/feb → 1/nov", "Todo el empalme"],
     index=0,
     help="Esto solo afecta los gráficos y la tabla. El modelo SIEMPRE se ejecuta sobre todo el empalme."
-)
-
-st.sidebar.markdown("---")
-meteo_history_url_override = st.sidebar.text_input(
-    "URL de meteo_history.csv (opcional)",
-    value="https://github.com/PREDWEEM/AVEFA2/blob/main/meteo_history.csv",
-    help="Pegá blob o raw; se convierte a raw automáticamente."
 )
 
 # --- Cargar pesos ---
@@ -455,9 +361,56 @@ if pesos is None:
 IW, bias_IW, LW, bias_out = pesos
 modelo = PracticalANNModel(IW, bias_IW, LW, float(bias_out))
 
-# ====================== Empalme ======================
+# ====================== EMPALME: histórico GitHub + futuro público ======================
 HIST_START = pd.Timestamp(2025, 1, 1)
 HIST_END   = pd.Timestamp(2025, 9, 3)   # inclusive
+
+def _normalize_meteo_generic(df_in: pd.DataFrame) -> pd.DataFrame:
+    if df_in is None or df_in.empty:
+        return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
+    df = df_in.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    lower = {c.lower(): c for c in df.columns}
+    def pick(*cands):
+        for c in cands:
+            if c in lower:
+                return lower[c]
+        return None
+    c_fecha = pick("fecha","date","fech","día","dia","fch")
+    c_doy   = pick("julian_days","julianday","julian","doy","dia_juliano","diajuliano","juliano","dayofyear","día juliano","dia juliano")
+    c_tmax  = pick("tmax","t_max","tx","t máx","t max","t. max")
+    c_tmin  = pick("tmin","t_min","tn","t mín","t min","t. min")
+    c_prec  = pick("prec","ppt","precip","lluvia","mm","prcp","precipitacion","precipitación")
+    mapping = {}
+    if c_fecha: mapping[c_fecha] = "Fecha"
+    if c_doy:   mapping[c_doy]   = "Julian_days"
+    if c_tmax:  mapping[c_tmax]  = "TMAX"
+    if c_tmin:  mapping[c_tmin]  = "TMIN"
+    if c_prec:  mapping[c_prec]  = "Prec"
+    if mapping:
+        df = df.rename(columns=mapping)
+    if "Julian_days" in df.columns:
+        df["Julian_days"] = pd.to_numeric(df["Julian_days"], errors="coerce")
+        df["Fecha"] = pd.to_datetime("2025-01-01") + pd.to_timedelta(df["Julian_days"] - 1, unit="D")
+    elif "Fecha" in df.columns:
+        df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce", dayfirst=True)
+        df["Julian_days"] = pd.to_datetime(df["Fecha"]).dt.dayofyear
+    else:
+        return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
+    for c in ["TMAX","TMIN","Prec"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    if "Prec" in df.columns:
+        df["Prec"] = df["Prec"].clip(lower=0)
+    if {"TMAX","TMIN"}.issubset(df.columns):
+        m = df["TMAX"] < df["TMIN"]
+        if m.any():
+            df.loc[m, ["TMAX","TMIN"]] = df.loc[m, ["TMIN","TMAX"]].values
+    df = df.dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
+    for need in ["TMAX","TMIN","Prec"]:
+        if need not in df.columns:
+            df[need] = np.nan
+    return df[["Fecha","Julian_days","TMAX","TMIN","Prec"]]
 
 def _load_attached_history_from_github() -> pd.DataFrame:
     try:
@@ -514,7 +467,7 @@ if not df_hist_attached.empty:
     if df_hist_attached.empty:
         st.error("El histórico (GitHub/fallback) no tiene filas dentro de 2025-01-01 → 2025-09-03.")
 
-# Verificación de huecos en el histórico
+# Verificación de huecos en todo el histórico esperado
 if not df_hist_attached.empty:
     full_hist_range = pd.date_range(HIST_START, HIST_END, freq="D")
     present = pd.to_datetime(df_hist_attached["Fecha"]).dt.normalize().unique()
@@ -525,57 +478,17 @@ if not df_hist_attached.empty:
     else:
         st.info("Histórico (01-ene → 03-sep) completo ✅")
 
-# Futuro: SOLO fechas > HIST_END, desde meteo_history.csv (con diagnóstico y fallback)
-def _leer_meteo_history_solo_futuro():
-    df_pub, diag = load_meteo_history_csv(meteo_history_url_override)
-    with st.expander("🧪 Diagnóstico meteo_history.csv"):
-        st.write("URL usada:", diag["used_url"])
-        st.write("Estado:", "OK ✅" if diag["ok"] else "FALLÓ ❌")
-        st.write("Motivo:", diag["why"])
-        st.write("Forma (filas, columnas):", diag["shape"])
-        st.write("Columnas:", diag["cols"])
-        st.write("Rango de fechas:", diag["min"], "→", diag["max"])
-    if df_pub.empty:
-        raise RuntimeError(diag["why"] or "meteo_history.csv vacío o ilegible")
+def _leer_public_csv_solo_futuro():
+    df_pub = load_public_csv()
     df_pub = _sanitize_meteo(df_pub)
     if "Fecha" not in df_pub.columns or not np.issubdtype(df_pub["Fecha"].dtype, np.datetime64):
         df_pub["Fecha"] = pd.to_datetime("2025-01-01") + pd.to_timedelta(df_pub["Julian_days"] - 1, unit="D")
     df_pub = df_pub.sort_values("Fecha").reset_index(drop=True)
     return df_pub.loc[df_pub["Fecha"] > HIST_END].copy()
 
-# Intento de carga automática
-df_future_pub = None
-try:
-    df_future_pub = _leer_meteo_history_solo_futuro()
-except Exception:
-    df_future_pub = None
+df_future_pub = safe_run(_leer_public_csv_solo_futuro, "No se pudo cargar el CSV público.")
 
-# Fallback manual si sigue fallando
-if df_future_pub is None or df_future_pub.empty:
-    st.warning("No pude cargar futuro desde meteo_history.csv. Probá subirlo manualmente:")
-    up_hist = st.file_uploader("Subí meteo_history.csv (solo futuro > 2025-09-03)", type=["csv"], key="mh_up")
-    if up_hist is not None:
-        try:
-            try:
-                df0 = pd.read_csv(up_hist, sep=";", decimal=",", engine="python", encoding="utf-8-sig")
-            except Exception:
-                up_hist.seek(0)
-                df0 = pd.read_csv(up_hist, engine="python", encoding="utf-8-sig")
-            df_norm = _normalize_meteo_generic(df0)
-            df_norm = _sanitize_meteo(df_norm)
-            if "Fecha" not in df_norm.columns or not np.issubdtype(df_norm["Fecha"].dtype, np.datetime64):
-                df_norm["Fecha"] = pd.to_datetime("2025-01-01") + pd.to_timedelta(df_norm["Julian_days"] - 1, unit="D")
-            df_norm = df_norm.sort_values("Fecha")
-            df_future_pub = df_norm[df_norm["Fecha"] > HIST_END].copy()
-            st.success(f"Cargado manualmente. Futuro detectado: {len(df_future_pub)} fila(s).")
-        except Exception as e:
-            st.error(f"No pude leer el archivo subido ({e}).")
-            df_future_pub = pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
-
-if df_future_pub is None:
-    df_future_pub = pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
-
-# Unión: GitHub (1-ene→3-sep) + meteo_history.csv (>3-sep)
+# Unión: GitHub (manda en 1-ene→3-sep) + público (>3-sep)
 base_hist = df_hist_attached.copy() if (df_hist_attached is not None and not df_hist_attached.empty) \
            else pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
 df_future_pub = df_future_pub.loc[df_future_pub["Fecha"] > HIST_END] if df_future_pub is not None \
@@ -584,7 +497,7 @@ df_future_pub = df_future_pub.loc[df_future_pub["Fecha"] > HIST_END] if df_futur
 df_empalmado = pd.concat([base_hist, df_future_pub], ignore_index=True)
 df_empalmado = df_empalmado.dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
 
-# Persistencia local + FREEZE_HISTORY
+# Persistencia local combinada con FREEZE_HISTORY
 try:
     df_prev_local = _load_local_history(LOCAL_HISTORY_PATH)
     df_union = _union_histories(df_prev_local, df_empalmado, freeze_existing=FREEZE_HISTORY)
@@ -603,53 +516,12 @@ cal_aug = pd.date_range(aug_start, aug_end, freq="D")
 fechas_emp = pd.to_datetime(df_empalmado["Fecha"]).dt.normalize().unique()
 faltan_aug = [d for d in cal_aug if d.normalize().to_datetime64() not in fechas_emp]
 if faltan_aug:
-    st.warning(f"Faltan {len(faltan_aug)} fecha(s) de agosto en el empalme: " + ", ".join(d.strftime("%d-%m") for d in faltan_aug))
+    st.warning(f"Faltan {len(faltan_aug)} fecha(s) de agosto en el empalme: " +
+               ", ".join(d.strftime("%d-%m") for d in faltan_aug))
 else:
     st.info("Agosto 2025 completo en el empalme ✅")
 
-# ===== Diagnóstico de empalme (FIX st.metric: usa strings) =====
-with st.expander("🔎 Diagnóstico de empalme (histórico + futuro)"):
-    hist_last = base_hist["Fecha"].max() if not base_hist.empty else pd.NaT
-    fut_first = df_future_pub["Fecha"].min() if not df_future_pub.empty else pd.NaT
-
-    def fmt_date(x):
-        try:
-            if pd.notna(x):
-                return pd.to_datetime(x).strftime("%Y-%m-%d")
-        except Exception:
-            pass
-        return "—"
-
-    hist_last_str = fmt_date(hist_last)
-    fut_first_str = fmt_date(fut_first)
-
-    dups = int(df_empalmado["Fecha"].duplicated().sum())
-    borde_ok = None
-    if pd.notna(hist_last) and pd.notna(fut_first):
-        borde_ok = (fut_first > HIST_END) and (hist_last == HIST_END) and ((fut_first - hist_last).days == 1)
-
-    df_empalmado_sorted = df_empalmado.sort_values("Fecha")
-    gaps = int((df_empalmado_sorted["Fecha"].diff().dt.days.dropna() > 1).sum())
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Último día histórico (BORDE2025)", hist_last_str)
-    with col2:
-        st.metric("Primer día futuro (meteo_history)", fut_first_str)
-    with col3:
-        st.metric("Días futuros detectados", int((df_empalmado["Fecha"] > HIST_END).sum()))
-
-    st.write("• Duplicados de fecha en el empalme:", dups)
-    st.write("• Gaps (>1 día) en el empalme:", gaps)
-    st.write("• Transición 03-sep→04-sep correcta:", "✅" if borde_ok else "⚠️")
-
-    borde_view = df_empalmado[
-        (df_empalmado["Fecha"] >= HIST_END - pd.Timedelta(days=2)) &
-        (df_empalmado["Fecha"] <= HIST_END + pd.Timedelta(days=3))
-    ].copy().sort_values("Fecha")
-    st.dataframe(borde_view, use_container_width=True)
-
-# ===== Hash y predicción =====
+# ===== Hash del empalme y recálculo automático del modelo =====
 def _df_hash(df: pd.DataFrame) -> str:
     if df is None or df.empty:
         return "empty"
@@ -689,12 +561,12 @@ else:
 # Avisos de futuro
 futuros = int((df_empalmado["Fecha"] > HIST_END).sum())
 if futuros == 0:
-    st.info("Empalme OK. Por ahora no hay días posteriores a 2025-09-03 en meteo_history.csv; se muestra solo el histórico de GitHub.")
+    st.info("Empalme OK. Por ahora no hay días posteriores a 2025-09-03 en el CSV público; se muestra solo el histórico de GitHub.")
 else:
     st.success(f"Empalme OK. Futuro detectado: {futuros} día(s) posteriores a 2025-09-03.")
 
-# ====================== Visualización ======================
-nombre = "Histórico GitHub + meteo_history.csv"
+# ====================== Procesamiento y visualización ======================
+nombre = "Histórico GitHub + Pronóstico público"
 df = df_empalmado.copy()
 ok, msg = validar_columnas_meteo(df)
 if not ok:
@@ -703,17 +575,14 @@ if not ok:
 
 pred = pred_all.copy()
 
-# EMEAC global
+# EMEAC global (sobre TODO el empalme)
 pred["EMEAC (0-1) - mínimo"]    = pred["EMERREL acumulado"] / EMEAC_MIN_DEN
 pred["EMEAC (0-1) - máximo"]    = pred["EMERREL acumulado"] / EMEAC_MAX_DEN
 pred["EMEAC (0-1) - ajustable"] = pred["EMERREL acumulado"] / EMEAC_ADJ_DEN
 for col in ["EMEAC (0-1) - mínimo", "EMEAC (0-1) - máximo", "EMEAC (0-1) - ajustable"]:
     pred[col.replace("(0-1)", "(%)")] = (pred[col] * 100).clip(0, 100)
 
-# Rango de visualización
-st.sidebar.markdown("---")
-ALPHA = st.sidebar.slider("Opacidad de relleno MA5", 0.0, 1.0, 0.70, 0.05)
-
+# ====== Rango de visualización ======
 if rango_opcion == "Todo el empalme":
     pred_vis = pred.copy()
     fi, ff = pred_vis["Fecha"].min(), pred_vis["Fecha"].max()
@@ -744,89 +613,155 @@ else:
     y_max = pred_vis["EMEAC (%) - máximo (rango)"]
     y_adj = pred_vis["EMEAC (%) - ajustable (rango)"]
 
-# Colores y MA5
+# ====== Colores por nivel y MA5 ======
 colores_vis = obtener_colores(pred_vis["Nivel_Emergencia_relativa"])
 pred_vis["EMERREL_MA5"] = pred_vis["EMERREL(0-1)"].rolling(window=5, min_periods=1).mean()
 
-# Figura: EMERGENCIA RELATIVA DIARIA
+# ====== FIGURA: EMERGENCIA RELATIVA DIARIA (MA5 con relleno tricolor INTERNO, con opacidad) ======
 st.subheader("EMERGENCIA RELATIVA DIARIA")
 fig_er = go.Figure()
 
+# Barras coloreadas por nivel
 fig_er.add_bar(
     x=pred_vis["Fecha"],
     y=pred_vis["EMERREL(0-1)"],
     marker=dict(color=colores_vis.tolist()),
-    customdata=pred_vis["Nivel_Emergencia_relativa"].map({"Bajo": "🟢 Bajo", "Medio": "🟡 Medio", "Alto": "🔴 Alto"}),
+    customdata=pred_vis["Nivel_Emergencia_relativa"].map(
+        {"Bajo": "🟢 Bajo", "Medio": "🟡 Medio", "Alto": "🔴 Alto"}
+    ),
     hovertemplate="Fecha: %{x|%d-%b-%Y}<br>EMERREL: %{y:.3f}<br>Nivel: %{customdata}<extra></extra>",
     name="EMERREL (0-1)"
 )
 
+# Área interna bajo MA5 segmentada (0→0.01 verde, 0.01→0.05 amarillo, 0.05→MA5 rojo) con opacidad
 x = pred_vis["Fecha"]
 ma = pred_vis["EMERREL_MA5"].clip(lower=0)
-thr_low = float(THR_BAJO_MEDIO)
-thr_med = float(THR_MEDIO_ALTO)
+thr_low = float(THR_BAJO_MEDIO)   # 0.01
+thr_med = float(THR_MEDIO_ALTO)   # 0.05
 
 y0 = np.zeros(len(ma))
-y1 = np.minimum(ma, thr_low)
-y2 = np.minimum(ma, thr_med)
-y3 = ma
+y1 = np.minimum(ma, thr_low)   # tope verde
+y2 = np.minimum(ma, thr_med)   # tope amarillo
+y3 = ma                        # tope rojo
 
+# === Colores con opacidad suave ===
+ALPHA = 0.70  # ajustá 0.20–0.35 a gusto
 GREEN_RGBA  = f"rgba(0,166,81,{ALPHA})"
 YELLOW_RGBA = f"rgba(255,192,0,{ALPHA})"
 RED_RGBA    = f"rgba(229,57,53,{ALPHA})"
 
-fig_er.add_trace(go.Scatter(x=x, y=y0, mode="lines", line=dict(width=0), hoverinfo="skip", showlegend=False))
-fig_er.add_trace(go.Scatter(x=x, y=y1, mode="lines", line=dict(width=0), fill="tonexty", fillcolor=GREEN_RGBA, hoverinfo="skip", showlegend=False, name="Zona baja (verde)"))
-fig_er.add_trace(go.Scatter(x=x, y=y1, mode="lines", line=dict(width=0), hoverinfo="skip", showlegend=False))
-fig_er.add_trace(go.Scatter(x=x, y=y2, mode="lines", line=dict(width=0), fill="tonexty", fillcolor=YELLOW_RGBA, hoverinfo="skip", showlegend=False, name="Zona media (amarillo)"))
-fig_er.add_trace(go.Scatter(x=x, y=y2, mode="lines", line=dict(width=0), hoverinfo="skip", showlegend=False))
-fig_er.add_trace(go.Scatter(x=x, y=y3, mode="lines", line=dict(width=0), fill="tonexty", fillcolor=RED_RGBA, hoverinfo="skip", showlegend=False, name="Zona alta (rojo)"))
-
+# Base 0
 fig_er.add_trace(go.Scatter(
-    x=x, y=ma, mode="lines", line=dict(width=2),
+    x=x, y=y0, mode="lines",
+    line=dict(width=0),
+    hoverinfo="skip", showlegend=False
+))
+# Banda VERDE (hacia y0)
+fig_er.add_trace(go.Scatter(
+    x=x, y=y1, mode="lines",
+    line=dict(width=0),
+    fill="tonexty", fillcolor=GREEN_RGBA,
+    hoverinfo="skip", showlegend=False, name="Zona baja (verde)"
+))
+# Baseline y1
+fig_er.add_trace(go.Scatter(
+    x=x, y=y1, mode="lines",
+    line=dict(width=0),
+    hoverinfo="skip", showlegend=False
+))
+# Banda AMARILLA (hacia y1)
+fig_er.add_trace(go.Scatter(
+    x=x, y=y2, mode="lines",
+    line=dict(width=0),
+    fill="tonexty", fillcolor=YELLOW_RGBA,
+    hoverinfo="skip", showlegend=False, name="Zona media (amarillo)"
+))
+# Baseline y2
+fig_er.add_trace(go.Scatter(
+    x=x, y=y2, mode="lines",
+    line=dict(width=0),
+    hoverinfo="skip", showlegend=False
+))
+# Banda ROJA (hacia y2)
+fig_er.add_trace(go.Scatter(
+    x=x, y=y3, mode="lines",
+    line=dict(width=0),
+    fill="tonexty", fillcolor=RED_RGBA,
+    hoverinfo="skip", showlegend=False, name="Zona alta (rojo)"
+))
+
+# Línea MA5
+fig_er.add_trace(go.Scatter(
+    x=x, y=ma, mode="lines",
+    line=dict(width=2),
     name="Media móvil 5 días",
     hovertemplate="Fecha: %{x|%d-%b-%Y}<br>MA5: %{y:.3f}<extra></extra>"
 ))
 
-fig_er.add_trace(go.Scatter(x=[x.min(), x.max()], y=[thr_low, thr_low], mode="lines", line=dict(color=COLOR_MAP["Bajo"], dash="dot"), name=f"Bajo (≤ {thr_low:.3f})", hoverinfo="skip"))
-fig_er.add_trace(go.Scatter(x=[x.min(), x.max()], y=[thr_med, thr_med], mode="lines", line=dict(color=COLOR_MAP["Medio"], dash="dot"), name=f"Medio (≤ {thr_med:.3f})", hoverinfo="skip"))
-fig_er.add_trace(go.Scatter(x=[None], y=[None], mode="lines", line=dict(color=COLOR_MAP["Alto"], dash="dot"), name=f"Alto (> {thr_med:.3f})", hoverinfo="skip"))
+# Líneas de referencia (umbral bajo/medio) usando paleta
+fig_er.add_trace(go.Scatter(x=[x.min(), x.max()], y=[thr_low, thr_low],
+    mode="lines", line=dict(color=COLOR_MAP["Bajo"], dash="dot"),
+    name=f"Bajo (≤ {thr_low:.3f})", hoverinfo="skip"))
+fig_er.add_trace(go.Scatter(x=[x.min(), x.max()], y=[thr_med, thr_med],
+    mode="lines", line=dict(color=COLOR_MAP["Medio"], dash="dot"),
+    name=f"Medio (≤ {thr_med:.3f})", hoverinfo="skip"))
+fig_er.add_trace(go.Scatter(x=[None], y=[None], mode="lines",
+    line=dict(color=COLOR_MAP["Alto"], dash="dot"),
+    name=f"Alto (> {thr_med:.3f})", hoverinfo="skip"))
 
 fi, ff = x.min(), x.max()
-fig_er.update_layout(xaxis_title="Fecha", yaxis_title="EMERREL (0-1)", hovermode="x unified", legend_title="Referencias", height=650)
-fig_er.update_xaxes(range=[fi, ff], dtick="D1" if (ff-fi).days <= 31 else "M1", tickformat="%d-%b" if (ff-fi).days <= 31 else "%b")
+fig_er.update_layout(
+    xaxis_title="Fecha", yaxis_title="EMERREL (0-1)",
+    hovermode="x unified", legend_title="Referencias", height=650
+)
+fig_er.update_xaxes(range=[fi, ff], dtick="D1" if (ff-fi).days <= 31 else "M1",
+                    tickformat="%d-%b" if (ff-fi).days <= 31 else "%b")
 fig_er.update_yaxes(rangemode="tozero")
 st.plotly_chart(fig_er, use_container_width=True, theme="streamlit")
 
-# Figura: EMERGENCIA ACUMULADA
+# ====== FIGURA: EMERGENCIA ACUMULADA ======
 st.subheader("EMERGENCIA ACUMULADA DIARIA")
-if rango_opcion == "Todo el empalme":
-    y_min = pred_vis["EMEAC (%) - mínimo"]; y_max = pred_vis["EMEAC (%) - máximo"]; y_adj = pred_vis["EMEAC (%) - ajustable"]
-else:
-    y_min = pred_vis["EMEAC (%) - mínimo (rango)"]; y_max = pred_vis["EMEAC (%) - máximo (rango)"]; y_adj = pred_vis["EMEAC (%) - ajustable (rango)"]
-
 fig = go.Figure()
-fig.add_trace(go.Scatter(x=pred_vis["Fecha"], y=y_max, mode="lines", line=dict(width=0), name="Máximo", hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Máximo: %{y:.1f}%<extra></extra>"))
-fig.add_trace(go.Scatter(x=pred_vis["Fecha"], y=y_min, mode="lines", line=dict(width=0), fill="tonexty", name="Mínimo", hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Mínimo: %{y:.1f}%<extra></extra>"))
-fig.add_trace(go.Scatter(x=pred_vis["Fecha"], y=y_adj, mode="lines", line=dict(width=2.5), name=f"Umbral ajustable (/{EMEAC_ADJ_DEN:.2f})", hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Ajustable: %{y:.1f}%<extra></extra>"))
+fig.add_trace(go.Scatter(
+    x=pred_vis["Fecha"], y=y_max, mode="lines", line=dict(width=0),
+    name="Máximo", hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Máximo: %{y:.1f}%<extra></extra>"
+))
+fig.add_trace(go.Scatter(
+    x=pred_vis["Fecha"], y=y_min, mode="lines", line=dict(width=0),
+    fill="tonexty", name="Mínimo",
+    hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Mínimo: %{y:.1f}%<extra></extra>"
+))
+fig.add_trace(go.Scatter(
+    x=pred_vis["Fecha"], y=y_adj, mode="lines", line=dict(width=2.5),
+    name=f"Umbral ajustable (/{EMEAC_ADJ_DEN:.2f})",
+    hovertemplate="Fecha: %{x|%d-%b-%Y}<br>Ajustable: %{y:.1f}%<extra></extra>"
+))
 for nivel in [25, 50, 75, 90]:
     try:
         fig.add_hline(y=nivel, line_dash="dash", opacity=0.6, annotation_text=f"{nivel}%")
     except Exception:
-        fig.add_trace(go.Scatter(x=[pred_vis["Fecha"].min(), pred_vis["Fecha"].max()], y=[nivel, nivel], mode="lines", line=dict(dash="dash"), showlegend=False))
-fig.update_layout(xaxis_title="Fecha", yaxis_title="EMEAC (%)", yaxis=dict(range=[0, 100]), hovermode="x unified", legend_title="Referencias", height=600)
-fig.update_xaxes(range=[fi, ff], dtick="D1" if (ff-fi).days <= 31 else "M1", tickformat="%d-%b" if (ff-fi).days <= 31 else "%b")
+        fig.add_trace(go.Scatter(x=[pred_vis["Fecha"].min(), pred_vis["Fecha"].max()],
+                                 y=[nivel, nivel], mode="lines", line=dict(dash="dash"), showlegend=False))
+fig.update_layout(
+    xaxis_title="Fecha", yaxis_title="EMEAC (%)",
+    yaxis=dict(range=[0, 100]), hovermode="x unified",
+    legend_title="Referencias", height=600
+)
+fig.update_xaxes(range=[fi, ff], dtick="D1" if (ff-fi).days <= 31 else "M1",
+                 tickformat="%d-%b" if (ff-fi).days <= 31 else "%b")
 st.plotly_chart(fig, use_container_width=True, theme="streamlit")
 
-# Tabla de resultados
-st.subheader(f"Resultados ({'1/feb → 1/nov' if rango_opcion!='Todo el empalme' else f'{fi.date()} → {ff.date()}'}) - {nombre}")
+# ====== TABLA: Resultados ======
+st.subheader(f"Resultados ({rango_txt}) - {nombre}")
 col_emeac = "EMEAC (%) - ajustable" if rango_opcion == "Todo el empalme" else "EMEAC (%) - ajustable (rango)"
 nivel_icono = {"Bajo": "🟢 Bajo", "Medio": "🟡 Medio", "Alto": "🔴 Alto"}
 tabla_rango = pred_vis[["Fecha","Julian_days","Nivel_Emergencia_relativa",col_emeac]].copy()
-tabla_rango["Nivel de EMERREL"] = tabla_rango["Nivel_Emergencia_relativa"].map(nivel_icono).fillna("🟢 Bajo")
-tabla_rango = tabla_rango.rename(columns={col_emeac:"EMEAC (%)"})
+tabla_rango["Nivel_Emergencia_relativa"] = tabla_rango["Nivel_Emergencia_relativa"].map(nivel_icono)
+tabla_rango = tabla_rango.rename(columns={"Nivel_Emergencia_relativa":"Nivel de EMERREL", col_emeac:"EMEAC (%)"})
+tabla_rango = tabla_rango.sort_values("Fecha").reset_index(drop=True)
+tabla_rango["Nivel de EMERREL"] = tabla_rango["Nivel de EMERREL"].fillna("🟢 Bajo")
 tabla_rango["EMEAC (%)"] = pd.to_numeric(tabla_rango["EMEAC (%)"], errors="coerce").fillna(0).clip(0, 100)
-tabla_rango = tabla_rango[["Fecha","Julian_days","Nivel de EMERREL","EMEAC (%)"]].sort_values("Fecha").reset_index(drop=True)
+
 st.dataframe(tabla_rango, use_container_width=True)
 
 csv_buf = StringIO(); tabla_rango.to_csv(csv_buf, index=False)
