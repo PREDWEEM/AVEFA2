@@ -213,8 +213,8 @@ def load_meteo_history_csv(maybe_url_override: str = ""):
     if isinstance(maybe_url_override, str) and maybe_url_override.strip():
         urls.append(maybe_url_override.strip())
     urls.extend([
-        "https://PREDWEEM.github.io/ANN/meteo_history.csv",
-        "https://raw.githubusercontent.com/PREDWEEM/ANN/gh-pages/meteo_history.csv",
+        "https://github.com/PREDWEEM/AVEFA2/blob/main/meteo_history.csv",
+        
     ])
 
     last_err = None
