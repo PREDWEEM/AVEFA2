@@ -161,7 +161,7 @@ def load_meteo_history_csv():
     for url in urls:
         try:
             raw = _fetch_bytes(url)
-            # Intentamos variantes de separador/decimal
+            # Variantes de separador/decimal
             for use_sc, dec in [(True, ","), (True, "."), (False, ".")]:
                 try:
                     bio = BytesIO(raw)
@@ -544,34 +544,46 @@ if faltan_aug:
 else:
     st.info("Agosto 2025 completo en el empalme ✅")
 
-# ===== Diagnóstico de empalme =====
+# ===== Diagnóstico de empalme (FIX st.metric: usar strings) =====
 with st.expander("🔎 Diagnóstico de empalme (histórico + futuro)"):
-    hist_last = base_hist["Fecha"].max() if not base_hist.empty else None
-    fut_first = df_future_pub["Fecha"].min() if not df_future_pub.empty else None
+    hist_last = base_hist["Fecha"].max() if not base_hist.empty else pd.NaT
+    fut_first = df_future_pub["Fecha"].min() if not df_future_pub.empty else pd.NaT
 
-    dups = df_empalmado["Fecha"].duplicated().sum()
+    def fmt_date(x):
+        try:
+            if pd.notna(x):
+                return pd.to_datetime(x).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+        return "—"
+
+    hist_last_str = fmt_date(hist_last)
+    fut_first_str = fmt_date(fut_first)
+
+    dups = int(df_empalmado["Fecha"].duplicated().sum())
     borde_ok = None
-    if hist_last is not None and fut_first is not None:
+    if pd.notna(hist_last) and pd.notna(fut_first):
         borde_ok = (fut_first > HIST_END) and (hist_last == HIST_END) and ((fut_first - hist_last).days == 1)
 
     df_empalmado_sorted = df_empalmado.sort_values("Fecha")
-    gaps = (df_empalmado_sorted["Fecha"].diff().dt.days.dropna() > 1).sum()
+    gaps = int((df_empalmado_sorted["Fecha"].diff().dt.days.dropna() > 1).sum())
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Último día histórico (BORDE2025)", hist_last.date() if hist_last is not None else "—")
+        st.metric("Último día histórico (BORDE2025)", hist_last_str)
     with col2:
-        st.metric("Primer día futuro (meteo_history)", fut_first.date() if fut_first is not None else "—")
+        st.metric("Primer día futuro (meteo_history)", fut_first_str)
     with col3:
         st.metric("Días futuros detectados", int((df_empalmado["Fecha"] > HIST_END).sum()))
 
-    st.write("• Duplicados de fecha en el empalme:", int(dups))
-    st.write("• Gaps (>1 día) en el empalme:", int(gaps))
+    st.write("• Duplicados de fecha en el empalme:", dups)
+    st.write("• Gaps (>1 día) en el empalme:", gaps)
     st.write("• Transición 03-sep→04-sep correcta:", "✅" if borde_ok else "⚠️")
 
-    borde_view = df_empalmado[(df_empalmado["Fecha"] >= HIST_END - pd.Timedelta(days=2)) &
-                              (df_empalmado["Fecha"] <= HIST_END + pd.Timedelta(days=3))]\
-                              .copy().sort_values("Fecha")
+    borde_view = df_empalmado[
+        (df_empalmado["Fecha"] >= HIST_END - pd.Timedelta(days=2)) &
+        (df_empalmado["Fecha"] <= HIST_END + pd.Timedelta(days=3))
+    ].copy().sort_values("Fecha")
     st.dataframe(borde_view, use_container_width=True)
 
 # ===== Hash del empalme y recálculo automático del modelo =====
@@ -673,11 +685,10 @@ else:
 colores_vis = obtener_colores(pred_vis["Nivel_Emergencia_relativa"])
 pred_vis["EMERREL_MA5"] = pred_vis["EMERREL(0-1)"].rolling(window=5, min_periods=1).mean()
 
-# ====== FIGURA: EMERGENCIA RELATIVA DIARIA (MA5 con relleno tricolor INTERNO, con opacidad) ======
+# ====== FIGURA: EMERGENCIA RELATIVA DIARIA ======
 st.subheader("EMERGENCIA RELATIVA DIARIA")
 fig_er = go.Figure()
 
-# Barras coloreadas por nivel (podés añadir opacity global si lo deseás con opacity=0.85)
 fig_er.add_bar(
     x=pred_vis["Fecha"],
     y=pred_vis["EMERREL(0-1)"],
@@ -692,67 +703,34 @@ fig_er.add_bar(
 # Área interna bajo MA5 segmentada (0→0.01 verde, 0.01→0.05 amarillo, 0.05→MA5 rojo) con opacidad
 x = pred_vis["Fecha"]
 ma = pred_vis["EMERREL_MA5"].clip(lower=0)
-thr_low = float(THR_BAJO_MEDIO)   # 0.01
-thr_med = float(THR_MEDIO_ALTO)   # 0.05
+thr_low = float(THR_BAJO_MEDIO)
+thr_med = float(THR_MEDIO_ALTO)
 
 y0 = np.zeros(len(ma))
-y1 = np.minimum(ma, thr_low)   # tope verde
-y2 = np.minimum(ma, thr_med)   # tope amarillo
-y3 = ma                        # tope rojo
+y1 = np.minimum(ma, thr_low)
+y2 = np.minimum(ma, thr_med)
+y3 = ma
 
 GREEN_RGBA  = f"rgba(0,166,81,{ALPHA})"
 YELLOW_RGBA = f"rgba(255,192,0,{ALPHA})"
 RED_RGBA    = f"rgba(229,57,53,{ALPHA})"
 
-# Base 0
-fig_er.add_trace(go.Scatter(
-    x=x, y=y0, mode="lines",
-    line=dict(width=0),
-    hoverinfo="skip", showlegend=False
-))
-# Banda VERDE (hacia y0)
-fig_er.add_trace(go.Scatter(
-    x=x, y=y1, mode="lines",
-    line=dict(width=0),
-    fill="tonexty", fillcolor=GREEN_RGBA,
-    hoverinfo="skip", showlegend=False, name="Zona baja (verde)"
-))
-# Baseline y1
-fig_er.add_trace(go.Scatter(
-    x=x, y=y1, mode="lines",
-    line=dict(width=0),
-    hoverinfo="skip", showlegend=False
-))
-# Banda AMARILLA (hacia y1)
-fig_er.add_trace(go.Scatter(
-    x=x, y=y2, mode="lines",
-    line=dict(width=0),
-    fill="tonexty", fillcolor=YELLOW_RGBA,
-    hoverinfo="skip", showlegend=False, name="Zona media (amarillo)"
-))
-# Baseline y2
-fig_er.add_trace(go.Scatter(
-    x=x, y=y2, mode="lines",
-    line=dict(width=0),
-    hoverinfo="skip", showlegend=False
-))
-# Banda ROJA (hacia y2)
-fig_er.add_trace(go.Scatter(
-    x=x, y=y3, mode="lines",
-    line=dict(width=0),
-    fill="tonexty", fillcolor=RED_RGBA,
-    hoverinfo="skip", showlegend=False, name="Zona alta (rojo)"
-))
+fig_er.add_trace(go.Scatter(x=x, y=y0, mode="lines", line=dict(width=0), hoverinfo="skip", showlegend=False))
+fig_er.add_trace(go.Scatter(x=x, y=y1, mode="lines", line=dict(width=0), fill="tonexty",
+                            fillcolor=GREEN_RGBA, hoverinfo="skip", showlegend=False, name="Zona baja (verde)"))
+fig_er.add_trace(go.Scatter(x=x, y=y1, mode="lines", line=dict(width=0), hoverinfo="skip", showlegend=False))
+fig_er.add_trace(go.Scatter(x=x, y=y2, mode="lines", line=dict(width=0), fill="tonexty",
+                            fillcolor=YELLOW_RGBA, hoverinfo="skip", showlegend=False, name="Zona media (amarillo)"))
+fig_er.add_trace(go.Scatter(x=x, y=y2, mode="lines", line=dict(width=0), hoverinfo="skip", showlegend=False))
+fig_er.add_trace(go.Scatter(x=x, y=y3, mode="lines", line=dict(width=0), fill="tonexty",
+                            fillcolor=RED_RGBA, hoverinfo="skip", showlegend=False, name="Zona alta (rojo)"))
 
-# Línea MA5
 fig_er.add_trace(go.Scatter(
-    x=x, y=ma, mode="lines",
-    line=dict(width=2),
+    x=x, y=ma, mode="lines", line=dict(width=2),
     name="Media móvil 5 días",
     hovertemplate="Fecha: %{x|%d-%b-%Y}<br>MA5: %{y:.3f}<extra></extra>"
 ))
 
-# Líneas de referencia (umbral bajo/medio) usando paleta
 fig_er.add_trace(go.Scatter(x=[x.min(), x.max()], y=[thr_low, thr_low],
     mode="lines", line=dict(color=COLOR_MAP["Bajo"], dash="dot"),
     name=f"Bajo (≤ {thr_low:.3f})", hoverinfo="skip"))
