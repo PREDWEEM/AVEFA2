@@ -1,7 +1,7 @@
 # app_emergencia.py — AVEFA
-# (lockdown + empalme histórico adjunto 01-ene-2025 → 03-sep-2025 + futuro meteo_history.csv
+# (lockdown + empalme 01-ene-2025 → 03-sep-2025 BORDE2025.csv + futuro meteo_history.csv
 #  + MA5 con relleno tricolor INTERNO (verde/amarillo/rojo, con opacidad) + botón Actualizar
-#  + fix fechas dd/mm y DOY + lectura automática BORDE2025.csv desde GitHub)
+#  + fix fechas dd/mm y DOY + diagnóstico/override/fallback para meteo_history.csv)
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -68,9 +68,9 @@ EMEAC_MAX_DEN = 5.0
 
 # ====================== Colores por nivel (intensos) ======================
 COLOR_MAP = {
-    "Bajo":  "#00A651",  # verde intenso
-    "Medio": "#FFC000",  # amarillo intenso
-    "Alto":  "#E53935"   # rojo intenso
+    "Bajo":  "#00A651",
+    "Medio": "#FFC000",
+    "Alto":  "#E53935"
 }
 COLOR_FALLBACK = "#808080"
 
@@ -150,54 +150,7 @@ def load_borde_from_github() -> pd.DataFrame:
             continue
     raise RuntimeError(f"No pude leer BORDE2025.csv desde GitHub. Último error: {last_err}")
 
-# ====================== LECTOR DEL FUTURO: meteo_history.csv ======================
-@st.cache_data(ttl=900)
-def load_meteo_history_csv():
-    urls = [
-        "https://PREDWEEM.github.io/ANN/meteo_history.csv",
-        "https://raw.githubusercontent.com/PREDWEEM/ANN/gh-pages/meteo_history.csv"
-    ]
-    last_err = None
-    for url in urls:
-        try:
-            raw = _fetch_bytes(url)
-            # Variantes de separador/decimal
-            for use_sc, dec in [(True, ","), (True, "."), (False, ".")]:
-                try:
-                    bio = BytesIO(raw)
-                    if use_sc:
-                        df = pd.read_csv(bio, sep=";", decimal=dec, parse_dates=False)
-                    else:
-                        df = pd.read_csv(bio, decimal=dec, parse_dates=False)
-
-                    # Normalización flexible de columnas
-                    if "Fecha" in df.columns:
-                        df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce", dayfirst=True)
-                    if "Julian_days" not in df.columns and "Fecha" in df.columns:
-                        df["Julian_days"] = pd.to_datetime(df["Fecha"]).dt.dayofyear
-                    elif "Julian_days" in df.columns and "Fecha" not in df.columns:
-                        jd = pd.to_numeric(df["Julian_days"], errors="coerce")
-                        df["Fecha"] = pd.to_datetime("2025-01-01") + pd.to_timedelta(jd - 1, unit="D")
-
-                    req = {"Fecha", "Julian_days", "TMAX", "TMIN", "Prec"}
-                    if not req.issubset(df.columns):
-                        continue
-
-                    for c in ["Julian_days", "TMAX", "TMIN", "Prec"]:
-                        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-                    df = _sanitize_meteo(df)
-                    if "Fecha" not in df.columns or not np.issubdtype(df["Fecha"].dtype, np.datetime64):
-                        df["Fecha"] = pd.to_datetime("2025-01-01") + pd.to_timedelta(df["Julian_days"] - 1, unit="D")
-
-                    return df.sort_values("Fecha").reset_index(drop=True)
-                except Exception:
-                    continue
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(f"No se pudo cargar meteo_history.csv público. Último error: {last_err}")
-
+# ====================== NORMALIZACIÓN FLEXIBLE ======================
 def _normalize_meteo_generic(df_in: pd.DataFrame) -> pd.DataFrame:
     if df_in is None or df_in.empty:
         return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
@@ -250,6 +203,72 @@ def _normalize_meteo_generic(df_in: pd.DataFrame) -> pd.DataFrame:
         if need not in df.columns:
             df[need] = np.nan
     return df[["Fecha","Julian_days","TMAX","TMIN","Prec"]]
+
+# ====================== LECTOR DEL FUTURO: meteo_history.csv (robusto + override + diagnóstico) ======================
+@st.cache_data(ttl=900)
+def load_meteo_history_csv(maybe_url_override: str = ""):
+    diag = {"ok": False, "used_url": None, "shape": None, "cols": None, "min": None, "max": None, "why": None}
+
+    urls: List[str] = []
+    if isinstance(maybe_url_override, str) and maybe_url_override.strip():
+        urls.append(maybe_url_override.strip())
+    urls.extend([
+        "https://PREDWEEM.github.io/ANN/meteo_history.csv",
+        "https://raw.githubusercontent.com/PREDWEEM/ANN/gh-pages/meteo_history.csv",
+    ])
+
+    last_err = None
+    for url in urls:
+        try:
+            raw = _fetch_bytes(url)
+            attempts = [
+                dict(sep=";", decimal=",", encoding="utf-8-sig"),
+                dict(sep=";", decimal=".", encoding="utf-8-sig"),
+                dict(sep=",", decimal=".", encoding="utf-8-sig"),
+            ]
+            for opt in attempts:
+                try:
+                    bio = BytesIO(raw)
+                    df0 = pd.read_csv(bio, engine="python", **opt)
+                    if df0 is None or df0.empty:
+                        continue
+
+                    df_norm = _normalize_meteo_generic(df0)
+                    if df_norm.empty:
+                        continue
+
+                    df_norm = _sanitize_meteo(df_norm)
+                    if "Fecha" not in df_norm.columns or not np.issubdtype(df_norm["Fecha"].dtype, np.datetime64):
+                        df_norm["Fecha"] = pd.to_datetime("2025-01-01") + pd.to_timedelta(df_norm["Julian_days"] - 1, unit="D")
+                    df_norm = df_norm.dropna(subset=["Fecha"]).sort_values("Fecha").reset_index(drop=True)
+
+                    diag.update({
+                        "ok": True,
+                        "used_url": url,
+                        "shape": df_norm.shape,
+                        "cols": list(df_norm.columns),
+                        "min": str(df_norm["Fecha"].min().date()) if not df_norm.empty else None,
+                        "max": str(df_norm["Fecha"].max().date()) if not df_norm.empty else None,
+                        "why": "OK"
+                    })
+                    return df_norm, diag
+                except Exception as ee:
+                    last_err = ee
+                    continue
+        except Exception as e:
+            last_err = e
+            continue
+
+    diag.update({
+        "ok": False,
+        "used_url": None,
+        "shape": None,
+        "cols": None,
+        "min": None,
+        "max": None,
+        "why": f"Fallo al leer meteo_history.csv. Último error: {last_err!r}"
+    })
+    return pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"]), diag
 
 # ====================== PERSISTENCIA LOCAL (CSV) ======================
 LOCAL_HISTORY_PATH = st.secrets.get("LOCAL_HISTORY_PATH", "avefa_history_local.csv")
@@ -330,7 +349,7 @@ def _union_histories(df_prev: pd.DataFrame, df_new: pd.DataFrame, freeze_existin
     base["Julian_days"] = base["Fecha"].dt.dayofyear
     for c in ["TMAX","TMIN","Prec"]:
         if c in base.columns:
-            base[c] = pd.to_numeric(base[c], errors="coerce")
+            base[c] = pd.to_numeric(cast := base[c], errors="coerce")
     base[["Julian_days","TMAX","TMIN","Prec"]] = base[["Julian_days","TMAX","TMIN","Prec"]].interpolate(limit_direction="both")
     m = base["TMAX"] < base["TMIN"]
     if m.any():
@@ -405,6 +424,14 @@ rango_opcion = st.sidebar.radio(
     ["1/feb → 1/nov", "Todo el empalme"],
     index=0,
     help="Esto solo afecta los gráficos y la tabla. El modelo SIEMPRE se ejecuta sobre todo el empalme."
+)
+
+# === NUEVO: override de URL para meteo_history.csv
+st.sidebar.markdown("---")
+meteo_history_url_override = st.sidebar.text_input(
+    "URL de meteo_history.csv (opcional)",
+    value="",
+    help="Si completás esto, la app usará esta URL en lugar de las URLs por defecto."
 )
 
 # --- Cargar pesos ---
@@ -500,16 +527,56 @@ if not df_hist_attached.empty:
     else:
         st.info("Histórico (01-ene → 03-sep) completo ✅")
 
-# ===== Futuro: SOLO fechas > HIST_END, desde meteo_history.csv
+# ===== Futuro: SOLO fechas > HIST_END, desde meteo_history.csv (con diagnóstico y fallback) =====
 def _leer_meteo_history_solo_futuro():
-    df_pub = load_meteo_history_csv()
+    df_pub, diag = load_meteo_history_csv(meteo_history_url_override)
+    with st.expander("🧪 Diagnóstico meteo_history.csv"):
+        st.write("URL usada:", diag["used_url"])
+        st.write("Estado:", "OK ✅" if diag["ok"] else "FALLÓ ❌")
+        st.write("Motivo:", diag["why"])
+        st.write("Forma (filas, columnas):", diag["shape"])
+        st.write("Columnas:", diag["cols"])
+        st.write("Rango de fechas:", diag["min"], "→", diag["max"])
+    if df_pub.empty:
+        raise RuntimeError(diag["why"] or "meteo_history.csv vacío o ilegible")
     df_pub = _sanitize_meteo(df_pub)
     if "Fecha" not in df_pub.columns or not np.issubdtype(df_pub["Fecha"].dtype, np.datetime64):
         df_pub["Fecha"] = pd.to_datetime("2025-01-01") + pd.to_timedelta(df_pub["Julian_days"] - 1, unit="D")
     df_pub = df_pub.sort_values("Fecha").reset_index(drop=True)
     return df_pub.loc[df_pub["Fecha"] > HIST_END].copy()
 
-df_future_pub = safe_run(_leer_meteo_history_solo_futuro, "No se pudo cargar meteo_history.csv.")
+# Intento de carga automática
+df_future_pub = None
+try:
+    df_future_pub = _leer_meteo_history_solo_futuro()
+except Exception:
+    df_future_pub = None
+
+# Fallback manual si sigue fallando
+if df_future_pub is None or df_future_pub.empty:
+    st.warning("No pude cargar futuro desde meteo_history.csv. Probá subirlo manualmente:")
+    up_hist = st.file_uploader("Subí meteo_history.csv (solo futuro > 2025-09-03)", type=["csv"], key="mh_up")
+    if up_hist is not None:
+        try:
+            try:
+                df0 = pd.read_csv(up_hist, sep=";", decimal=",", engine="python", encoding="utf-8-sig")
+            except Exception:
+                up_hist.seek(0)
+                df0 = pd.read_csv(up_hist, engine="python", encoding="utf-8-sig")
+            df_norm = _normalize_meteo_generic(df0)
+            df_norm = _sanitize_meteo(df_norm)
+            if "Fecha" not in df_norm.columns or not np.issubdtype(df_norm["Fecha"].dtype, np.datetime64):
+                df_norm["Fecha"] = pd.to_datetime("2025-01-01") + pd.to_timedelta(df_norm["Julian_days"] - 1, unit="D")
+            df_norm = df_norm.sort_values("Fecha")
+            df_future_pub = df_norm[df_norm["Fecha"] > HIST_END].copy()
+            st.success(f"Cargado manualmente. Futuro detectado: {len(df_future_pub)} fila(s).")
+        except Exception as e:
+            st.error(f"No pude leer el archivo subido ({e}).")
+            df_future_pub = pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
+
+# Garantizar DF con columnas esperadas
+if df_future_pub is None:
+    df_future_pub = pd.DataFrame(columns=["Fecha","Julian_days","TMAX","TMIN","Prec"])
 
 # Unión: GitHub (manda en 1-ene→3-sep) + meteo_history.csv (>3-sep)
 base_hist = df_hist_attached.copy() if (df_hist_attached is not None and not df_hist_attached.empty) \
