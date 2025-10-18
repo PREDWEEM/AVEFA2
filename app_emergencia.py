@@ -117,7 +117,7 @@ def cargar_modelo():
 # =================== PARÁMETROS ===================
 THR_BAJO_MEDIO = 0.01
 THR_MEDIO_ALTO = 0.05
-EMEAC_MIN_DEN, EMEAC_ADJ_DEN, EMEAC_MAX_DEN = 2.0, 3.0, 5.0
+EMEAC_MIN_DEN, EMEAC_ADJ_DEN, EMEAC_MAX_DEN = 2.0, 3.5, 5.0
 HIST_START = pd.Timestamp(2025, 1, 1)
 HIST_END   = pd.Timestamp(2025, 9, 3)  # inclusive
 COLOR_MAP = {"Bajo": "#00A651", "Medio": "#FFC000", "Alto": "#E53935"}
