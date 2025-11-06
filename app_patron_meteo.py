@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # ===============================================================
 # 🌾 APP — Predicción del Patrón Histórico de Emergencia (AVEFA / PREDWEEM)
-# Versión 2: con gauge de probabilidad y barra temporal de discriminación
+# Versión 3: Diagnóstico definitivo anclado al 1 de junio (JD ≈ 152)
 # ===============================================================
 
 import streamlit as st
@@ -19,6 +19,7 @@ TEMP_BASE = 0.0
 RAIN_DRY = 1.0
 MONTH_START = 9
 YEAR_REF = 2025
+JD_DIAG = 152  # 1 de junio
 
 # ---------- CARGA DE DATOS ----------
 @st.cache_data(ttl=600)
@@ -49,27 +50,30 @@ def classify_pattern(df):
     jd = df["julian_days"].to_numpy()
     gdd = df["gdd_cum"].to_numpy()
     rain = df["rain_cum"].to_numpy()
+
     def sum_in_window(v, start, end):
         m = (jd >= start) & (jd <= end)
         return float(np.nansum(v[m])) / max(1, end - start + 1)
+
     gdd_early, gdd_mid = sum_in_window(gdd, 60, 120), sum_in_window(gdd, 150, 210)
     rain_early, rain_mid = sum_in_window(rain, 60, 120), sum_in_window(rain, 150, 210)
+
     total_gdd, total_rain = np.nanmax(gdd), np.nanmax(rain)
     e_rel, m_rel = gdd_early / (total_gdd+1e-6), gdd_mid / (total_gdd+1e-6)
     r_e_rel, r_m_rel = rain_early / (total_rain+1e-6), rain_mid / (total_rain+1e-6)
+
     score_early = (e_rel * 0.6 + r_e_rel * 0.4)
     score_medium = (m_rel * 0.6 + r_m_rel * 0.4)
     score_staggered = (0.5 * (score_early + score_medium)) + abs(e_rel - m_rel) * 0.3
+
     scores = {"early": score_early, "staggered": score_staggered, "medium": score_medium}
     total = sum(scores.values())
     probs = {k: round(v / total, 3) for k, v in scores.items()}
-    if probs["early"] > 0.6:
-        fecha, clasif, jd_disc = "15 de abril (≈ JD 105)", "EARLY", 105
-    elif probs["medium"] > 0.6:
-        fecha, clasif, jd_disc = "1 de junio (≈ JD 152)", "MEDIUM", 152
-    else:
-        fecha, clasif, jd_disc = "1 de mayo (≈ JD 121)", "STAGGERED", 121
-    return clasif, fecha, probs, jd_disc
+
+    # Clasificación con diagnóstico al 1 de junio
+    clasif = max(probs, key=probs.get).upper()
+    fecha_diag = "1 de junio (JD 152)"
+    return clasif, fecha_diag, probs
 
 uploaded = st.file_uploader("📁 Cargar meteo_history.csv", type=["csv"])
 df = load_meteo_history(uploaded) if uploaded else load_meteo_history("meteo_history.csv")
@@ -77,13 +81,13 @@ if df.empty: st.error("No se pudieron cargar los datos."); st.stop()
 df = compute_indicators(df)
 
 # ---------- CLASIFICACIÓN ----------
-clasif, fecha, probs, jd_disc = classify_pattern(df)
+clasif, fecha, probs = classify_pattern(df)
 
 # ---------- VISUALIZACIÓN ----------
 col1, col2 = st.columns([1.2, 1])
 with col1:
     st.metric("🧩 Patrón clasificado", clasif)
-    st.write(f"📆 Fecha de predicción fiable: **{fecha}**")
+    st.write(f"📆 Fecha de diagnóstico definitivo: **{fecha}**")
     st.write("🔢 Probabilidades estimadas:")
     st.json(probs)
 with col2:
@@ -91,13 +95,12 @@ with col2:
     fig_gauge = go.Figure(go.Indicator(
         mode="gauge+number",
         value=val,
-        domain={'x': [0, 1], 'y': [0, 1]},
         title={'text': f"Probabilidad {clasif}", 'font': {'size': 22}},
         gauge={
             'axis': {'range': [0, 100]},
             'bar': {'color': "#00A651" if clasif=="EARLY" else "#E5C700" if clasif=="STAGGERED" else "#1976D2"},
             'steps': [
-                {'range': [0, 50], 'color': '#E5E5E5'},
+                {'range': [0, 50], 'color': '#EEEEEE'},
                 {'range': [50, 100], 'color': '#B3E5FC'}
             ]
         }
@@ -105,27 +108,17 @@ with col2:
     st.plotly_chart(fig_gauge, use_container_width=True)
 
 # ---------- BARRA TEMPORAL ----------
-st.subheader("📆 Línea temporal y discriminación del patrón")
+st.subheader("📆 Línea temporal (diagnóstico fijo 1 de junio)")
 fig_line = go.Figure()
-fig_line.add_trace(go.Scatter(
-    x=df["julian_days"], y=df["gdd_cum"], mode="lines", name="GDD acumulados", line=dict(color="red", width=2)
-))
-fig_line.add_trace(go.Scatter(
-    x=df["julian_days"], y=df["rain_cum"], mode="lines", name="Lluvia acumulada (mm)", line=dict(color="blue", width=2)
-))
-fig_line.add_vline(
-    x=jd_disc, line_width=3, line_dash="dash", line_color="green",
-    annotation_text=f"Diagnóstico ({fecha})", annotation_position="top"
-)
-fig_line.update_layout(
-    xaxis_title="Día Juliano (JD)", yaxis_title="Valor acumulado",
-    hovermode="x unified", height=500, legend_title="Variables"
-)
+fig_line.add_trace(go.Scatter(x=df["julian_days"], y=df["gdd_cum"], mode="lines", name="GDD acumulados", line=dict(color="red", width=2)))
+fig_line.add_trace(go.Scatter(x=df["julian_days"], y=df["rain_cum"], mode="lines", name="Lluvia acumulada (mm)", line=dict(color="blue", width=2)))
+fig_line.add_vline(x=JD_DIAG, line_width=3, line_dash="dash", line_color="green", annotation_text="Diagnóstico (1-Jun)", annotation_position="top")
+fig_line.update_layout(xaxis_title="Día Juliano (JD)", yaxis_title="Valor acumulado", hovermode="x unified", height=500, legend_title="Variables")
 st.plotly_chart(fig_line, use_container_width=True)
 
 # ---------- INTERPRETACIÓN AGRONÓMICA ----------
 st.markdown("---")
-st.subheader("🧠 Interpretación agronómica")
+st.subheader("🧠 Interpretación agronómica (Diagnóstico 1 de junio)")
 if clasif == "EARLY":
     st.success("🌱 **Patrón EARLY** — Emergencia concentrada en marzo–abril. Control presiembra y preemergente crucial.")
 elif clasif == "STAGGERED":
