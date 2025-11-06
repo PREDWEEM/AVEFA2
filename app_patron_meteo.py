@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 # ===============================================================
-# 🌾 AVEFA — Clasificador de patrones meteorológicos (desde imagen o simulación)
+# 🌾 AVEFA — Clasificador de patrones meteorológicos (imagen o simulación)
 # ---------------------------------------------------------------
 # - Carga de imagen (pegada o arrastrada)
 # - Análisis de patrones por picos y magnitud
 # - Clasificación: early / medium / staggered / late
-# - Fecha de corte: 1 de junio
+# - Cálculo de % de confianza
 # ===============================================================
 
 import streamlit as st
@@ -25,7 +25,7 @@ try:
 except ImportError:
     find_peaks = None
 
-# === FUNCIÓN ALTERNATIVA PARA DETECTAR PICOS (SI NO HAY SCIPY) ===
+# === ALTERNATIVA SI NO HAY SCIPY ===
 def find_local_peaks(y, threshold=0.01):
     peaks = []
     for i in range(1, len(y) - 1):
@@ -33,13 +33,13 @@ def find_local_peaks(y, threshold=0.01):
             peaks.append(i)
     return np.array(peaks)
 
-
 # === CONFIGURACIÓN GENERAL ===
-st.set_page_config(page_title="Clasificador de Patrones AVEFA", layout="centered")
+st.set_page_config(page_title="Clasificador AVEFA", layout="centered")
 st.title("🌾 Clasificador de Patrones (AVEFA)")
 st.markdown("""
-Esta herramienta permite **clasificar patrones de emergencia o crecimiento** según los picos
-y su magnitud hasta una fecha de corte (por defecto, el **1 de junio**).
+Esta herramienta detecta y clasifica los **patrones de emergencia** según los **picos** y su **magnitud**
+hasta una fecha de corte (por defecto, el **1 de junio**), e informa el **porcentaje de confianza**
+de la clasificación.
 """)
 
 # === PARÁMETROS ===
@@ -53,7 +53,6 @@ st.subheader("📸 Cargar imagen o patrón")
 uploaded_file = st.file_uploader("Arrastrá o pegá una imagen (png, jpg, jpeg):", type=["png", "jpg", "jpeg"])
 
 if uploaded_file is not None:
-    # Leer bytes e intentar mostrar
     bytes_data = uploaded_file.read()
     img_array = np.frombuffer(bytes_data, np.uint8)
 
@@ -65,12 +64,10 @@ if uploaded_file is not None:
         st.warning("⚠️ OpenCV no está disponible, la imagen se mostrará sin procesamiento.")
         st.image(uploaded_file, caption="Imagen cargada", use_column_width=True)
 
-    st.markdown("---")
+st.markdown("---")
 
-# === SIMULACIÓN DE DATOS (EJEMPLO) ===
+# === SIMULACIÓN DE DATOS ===
 st.subheader("🔍 Clasificación de patrones simulados (ejemplo)")
-
-# Simulación de curvas tipo emergencia
 fechas = pd.date_range("2010-01-01", "2010-11-01", freq="D")
 patrones = {
     "staggered": np.clip(np.sin(np.linspace(0, 10, len(fechas))) * 0.05 + np.random.rand(len(fechas)) * 0.03, 0, 0.12),
@@ -79,8 +76,7 @@ patrones = {
     "late": np.clip(np.exp(-0.5 * ((np.linspace(0, 1, len(fechas)) - 0.75) / 0.1) ** 2) * 0.10, 0, 0.10),
 }
 
-
-# === FUNCIÓN DE CLASIFICACIÓN ===
+# === FUNCIÓN DE CLASIFICACIÓN CON % DE CONFIANZA ===
 def clasificar_patron(y, fechas, ref=fecha_ref):
     fechas = pd.to_datetime(fechas)
     mask = fechas <= ref
@@ -88,17 +84,17 @@ def clasificar_patron(y, fechas, ref=fecha_ref):
     fechas = np.array(fechas)[mask]
 
     if len(y) == 0:
-        return {"n_picos": 0, "max_y": np.nan, "fecha_pico": None, "tipo": "sin datos"}
+        return {"n_picos": 0, "max_y": np.nan, "fecha_pico": None, "tipo": "sin datos", "confianza": 0}
 
-    # Detectar picos
+    # Detección de picos
     if find_peaks is not None:
-        peaks, _ = find_peaks(y, prominence=0.01)
+        peaks, props = find_peaks(y, prominence=0.01)
     else:
         peaks = find_local_peaks(y, threshold=0.01)
+        props = {"prominences": np.ones_like(peaks) * 0.02}
 
     n_picos = len(peaks)
     max_y = y[peaks].max() if n_picos > 0 else y.max()
-
     if n_picos > 0:
         fecha_pico = pd.to_datetime(fechas[peaks[np.argmax(y[peaks])]])
     else:
@@ -114,32 +110,43 @@ def clasificar_patron(y, fechas, ref=fecha_ref):
     else:
         tipo = "late"
 
+    # === Cálculo de confianza ===
+    prom = np.mean(props.get("prominences", [0.01]))
+    rango_picos = (np.max(y) - np.min(y)) if np.max(y) > 0 else 0.01
+    cv = np.std(y) / np.mean(y) if np.mean(y) > 0 else 0
+
+    confianza = 70 + (prom * 100) + (cv * 10)
+    confianza = np.clip(confianza, 0, 99.9)
+
     return {
         "n_picos": int(n_picos),
         "max_y": round(float(max_y), 4),
         "fecha_pico": fecha_pico.strftime("%Y-%m-%d"),
-        "tipo": tipo
+        "tipo": tipo,
+        "confianza": round(float(confianza), 1),
     }
 
-
 # === APLICACIÓN A LOS PATRONES ===
-resultados = {}
-for k, v in patrones.items():
-    resultados[k] = clasificar_patron(v, fechas)
-
+resultados = {k: clasificar_patron(v, fechas) for k, v in patrones.items()}
 res_df = pd.DataFrame(resultados).T
-st.dataframe(res_df)
 
-# === VISUALIZACIÓN ===
+# === MOSTRAR TABLA CON COLOR Y EMOJIS ===
+def formato_fila(row):
+    iconos = {"early": "🌱", "medium": "🌾", "staggered": "🌿", "late": "🍂"}
+    return f"{iconos.get(row['tipo'],'❓')} {row['tipo']} ({row['confianza']}%)"
+
+res_df["Resultado"] = res_df.apply(formato_fila, axis=1)
+st.dataframe(res_df[["n_picos", "max_y", "fecha_pico", "Resultado"]])
+
+# === GRAFICAR ===
 fig, ax = plt.subplots(figsize=(8, 5))
 for k, v in patrones.items():
-    ax.plot(fechas, v, label=k)
-ax.axvline(fecha_ref, color="k", linestyle="--", label=f"Corte: {fecha_ref.strftime('%d-%b')}")
-ax.set_title("Clasificación de patrones hasta la fecha de corte")
+    ax.plot(fechas, v, label=f"{k} ({res_df.loc[k, 'tipo']} · {res_df.loc[k, 'confianza']}%)")
+ax.axvline(fecha_ref, color="k", linestyle="--", label=f"Corte {fecha_ref.strftime('%d-%b')}")
+ax.set_title("Clasificación de patrones con % de confianza")
 ax.set_ylabel("Emergencia relativa")
 ax.legend()
 st.pyplot(fig)
 
-st.success("✅ Clasificación completada correctamente.")
-st.markdown("---")
-st.markdown("📘 **Tip:** Pegá una imagen de tu gráfico real para almacenarla junto al diagnóstico.")
+st.success("✅ Clasificación completada con estimación de confianza.")
+
