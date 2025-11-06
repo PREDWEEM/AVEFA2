@@ -3,8 +3,9 @@
 # 🌾 AVEFA — Clasificador híbrido (color o monocromo) + Exportación Excel
 # ---------------------------------------------------------------
 # - Detecta si el gráfico es colorido o monocromático
-# - Extrae curvas y clasifica según picos, magnitud y % confianza
-# - Exporta diagnóstico completo a archivo .xlsx descargable
+# - Extrae curvas, clasifica por picos/magnitud
+# - Calcula % de confianza
+# - Exporta resultados en Excel
 # ===============================================================
 
 import streamlit as st
@@ -14,6 +15,7 @@ import matplotlib.pyplot as plt
 import datetime as dt
 from io import BytesIO
 
+# ---- Dependencias opcionales ----
 try:
     import cv2
 except ImportError:
@@ -25,7 +27,7 @@ except ImportError:
     find_peaks = None
 
 
-# === Función de fallback para detección de picos ===
+# === Función alternativa si no hay SciPy ===
 def find_local_peaks(y, threshold=0.01):
     peaks = []
     for i in range(1, len(y) - 1):
@@ -34,7 +36,7 @@ def find_local_peaks(y, threshold=0.01):
     return np.array(peaks)
 
 
-# === Configuración de la app ===
+# === Configuración general ===
 st.set_page_config(page_title="Clasificador AVEFA híbrido", layout="wide")
 st.title("🌾 Clasificador de Patrones AVEFA (Color + Monocromo)")
 
@@ -62,13 +64,13 @@ img = cv2.imdecode(data, cv2.IMREAD_COLOR)
 img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 h, w = img.shape[:2]
 
-# === Detectar si es colorido o monocromático ===
+# === Detección de tipo de gráfico ===
 hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
 mean_sat = hsv[..., 1].mean()
 modo = "monocromo" if mean_sat < 30 else "color"
 st.caption(f"🔍 Detección automática: **{modo.upper()}** (Saturación media = {mean_sat:.1f})")
 
-# === Extracción de serie desde máscara ===
+# === Conversión de máscaras a series ===
 def mask_to_series(mask):
     H, W = mask.shape
     ys = np.full(W, np.nan)
@@ -106,18 +108,18 @@ else:
     series = {"principal": mask_to_series(mask)}
 
 
-# === Clasificación con interpolación segura ===
+# === Clasificación robusta ===
 def clasificar(y, fechas, ref):
     if y is None or len(y) < 5:
         return None
 
-    # Ajustar longitud de la serie al eje temporal
+    # Ajuste de longitud
     x_original = np.linspace(0, 1, len(y))
     x_target = np.linspace(0, 1, len(fechas))
     y_interp = np.interp(x_target, x_original, y)
     y = y_interp.copy()
 
-    # Corte hasta fecha de referencia
+    # Corte por fecha
     mask = fechas <= ref
     y = np.array(y)[mask]
     fechas = np.array(fechas)[mask]
@@ -139,8 +141,8 @@ def clasificar(y, fechas, ref):
     max_y = float(y_smooth.max())
     fecha_pico = fechas[peaks[np.argmax(y_smooth[peaks])]] if n_picos else fechas[np.argmax(y_smooth)]
 
-    # Clasificación
-    if n_picos > 1 and np.std(y_smooth) / max(np.mean(y_smooth), 1e-6) > 0.4:
+    # Tipo de patrón
+    if n_picos > 1 and np.std(y_smooth)/max(np.mean(y_smooth), 1e-6) > 0.4:
         tipo = "staggered"
     elif fecha_pico < dt.datetime(ref.year, 4, 1):
         tipo = "early"
@@ -150,14 +152,20 @@ def clasificar(y, fechas, ref):
         tipo = "late"
 
     # Confianza
-    cv = np.std(y_smooth) / max(np.mean(y_smooth), 1e-9)
-    confianza = 65 + prom * 120 + cv * 10
+    cv = np.std(y_smooth)/max(np.mean(y_smooth), 1e-9)
+    confianza = 65 + prom*120 + cv*10
     confianza = float(np.clip(confianza, 0, 99.9))
+
+    # --- Conversión segura de fecha ---
+    try:
+        fecha_fmt = pd.to_datetime(fecha_pico).strftime("%Y-%m-%d")
+    except Exception:
+        fecha_fmt = str(fecha_pico)
 
     return {
         "n_picos": n_picos,
         "max_y": round(max_y, 4),
-        "fecha_pico": fecha_pico.strftime("%Y-%m-%d"),
+        "fecha_pico": fecha_fmt,
         "tipo": tipo,
         "confianza": round(confianza, 1),
         "y_full": y_smooth,
@@ -187,11 +195,10 @@ df = pd.DataFrame(rows)
 st.subheader("📊 Resultado de clasificación")
 st.dataframe(df, use_container_width=True)
 
-# === Exportar a Excel ===
+# === Exportación a Excel ===
 output = BytesIO()
 with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
     df.to_excel(writer, index=False, sheet_name="Clasificación")
-    writer.save()
 excel_data = output.getvalue()
 
 st.download_button(
@@ -201,7 +208,7 @@ st.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
 
-# === Gráfico reconstruido ===
+# === Visualización ===
 st.subheader("📈 Reconstrucción de curvas")
 fig, ax = plt.subplots(figsize=(8, 4))
 colors = {"staggered": "tab:blue", "early": "tab:orange", "medium": "tab:gray", "principal": "black"}
