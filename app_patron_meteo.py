@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # ===============================================================
 # 🌾 APP — Diagnóstico Histórico de Patrones de Emergencia
-# Versión 2: incluye JD y probabilidad de discriminación por año
+# Versión 3: gráfico de confianza por año (reemplaza GDD)
 # ===============================================================
 
 import streamlit as st
@@ -60,7 +60,6 @@ def clasificar_patron(df):
     total = s_early + s_med + s_stag
     probs = {k: round(v/total,3) for k,v in zip(["EARLY","STAGGERED","MEDIUM"], [s_early,s_stag,s_med])}
 
-    # Día de discriminación según patrón dominante
     if probs["EARLY"]>0.6: clasif, jd_c = "EARLY", 105
     elif probs["MEDIUM"]>0.6: clasif, jd_c = "MEDIUM", 152
     else: clasif, jd_c = "STAGGERED", 121
@@ -96,16 +95,31 @@ tabla = pd.DataFrame(diagnosticos).sort_values("Año")
 st.subheader("📊 Clasificación histórica por año")
 st.dataframe(tabla, use_container_width=True)
 
-# ---------- GRAFICO COMPARATIVO ----------
-st.subheader("📈 GDD acumulados por año")
-fig = go.Figure()
-for año, sub in df.groupby("año"):
-    fig.add_trace(go.Scatter(
-        x=sub["julian_days"], y=sub["gdd"].cumsum(),
-        mode="lines", name=str(año)
+# ---------- GRAFICO DE CONFIANZA ----------
+st.subheader("📈 Confianza del patrón clasificado por año")
+colors = {"EARLY": "#00A651", "STAGGERED": "#FFC107", "MEDIUM": "#1976D2"}
+
+fig_conf = go.Figure()
+for _, row in tabla.iterrows():
+    fig_conf.add_trace(go.Bar(
+        x=[row["Año"]],
+        y=[row["Probabilidad_discriminación"]*100],
+        name=row["Patrón"],
+        marker_color=colors[row["Patrón"]],
+        text=f"{row['Patrón']} ({row['Probabilidad_discriminación']*100:.1f}%)",
+        textposition="auto"
     ))
-fig.update_layout(xaxis_title="Día Juliano", yaxis_title="GDD acumulados", height=500, hovermode="x unified")
-st.plotly_chart(fig, use_container_width=True)
+
+fig_conf.update_layout(
+    barmode="group",
+    xaxis_title="Año",
+    yaxis_title="Confianza del patrón (%)",
+    yaxis=dict(range=[0,100]),
+    hovermode="x unified",
+    legend_title="Patrón clasificado",
+    height=500
+)
+st.plotly_chart(fig_conf, use_container_width=True)
 
 # ---------- INTERPRETACIÓN ----------
 st.markdown("---")
@@ -116,8 +130,8 @@ st.write("""
 - JD **121 (1 mayo)** → STAGGERED → confianza ≥ **85–90%**
 - JD **152 (1 junio)** → MEDIUM → confianza ≥ **90%**
 
-**Significado:**
-- *EARLY:* emergencia concentrada en otoño (marzo–abril).  
-- *STAGGERED:* emergencia en varias cohortes (otoño e invierno).  
-- *MEDIUM:* emergencia invernal tardía (junio–agosto).  
+**Lectura del gráfico:**
+- Barras altas (≥90%) indican pronósticos **muy certeros**.  
+- Barras entre 75–85% muestran **patrones mixtos o años transicionales**.
 """)
+
