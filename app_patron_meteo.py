@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 # ===============================================================
-# 🌾 AVEFA — Clasificador híbrido (color o monocromo)
+# 🌾 AVEFA — Clasificador híbrido (color o monocromo) + Exportación Excel
 # ---------------------------------------------------------------
-# - Si hay color → detecta curvas azul/naranja/gris (staggered/early/medium)
-# - Si es monocromo → detecta puntos o trazos negros y genera 1 sola serie
-# - Calcula picos, tipo, y % de confianza
+# - Detecta si el gráfico es colorido o monocromático
+# - Extrae curvas y clasifica según picos, magnitud y % confianza
+# - Exporta diagnóstico completo a archivo .xlsx descargable
 # ===============================================================
 
 import streamlit as st
@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import datetime as dt
+from io import BytesIO
 
 try:
     import cv2
@@ -23,6 +24,8 @@ try:
 except ImportError:
     find_peaks = None
 
+
+# === Función de fallback para detección de picos ===
 def find_local_peaks(y, threshold=0.01):
     peaks = []
     for i in range(1, len(y) - 1):
@@ -30,6 +33,8 @@ def find_local_peaks(y, threshold=0.01):
             peaks.append(i)
     return np.array(peaks)
 
+
+# === Configuración de la app ===
 st.set_page_config(page_title="Clasificador AVEFA híbrido", layout="wide")
 st.title("🌾 Clasificador de Patrones AVEFA (Color + Monocromo)")
 
@@ -42,13 +47,13 @@ ini = dt.datetime(default_year, 1, 1)
 fin = dt.datetime(default_year, 11, 1)
 dates = pd.date_range(ini, fin, 365)
 
-uploaded = st.file_uploader("📸 Cargá o pegá tu gráfico (PNG/JPG):", type=["png","jpg","jpeg"])
+uploaded = st.file_uploader("📸 Cargá o pegá tu gráfico (PNG/JPG):", type=["png", "jpg", "jpeg"])
 if uploaded is None:
     st.info("Cargá una imagen para continuar.")
     st.stop()
 
 if cv2 is None:
-    st.error("Falta `opencv-python-headless`. Instálalo para análisis de imagen.")
+    st.error("Falta `opencv-python-headless`. Instálalo para procesar imágenes.")
     st.stop()
 
 # === Leer imagen ===
@@ -57,19 +62,13 @@ img = cv2.imdecode(data, cv2.IMREAD_COLOR)
 img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 h, w = img.shape[:2]
 
-# === Detección de saturación media ===
+# === Detectar si es colorido o monocromático ===
 hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
 mean_sat = hsv[..., 1].mean()
+modo = "monocromo" if mean_sat < 30 else "color"
+st.caption(f"🔍 Detección automática: **{modo.upper()}** (Saturación media = {mean_sat:.1f})")
 
-if mean_sat < 30:
-    modo = "monocromo"
-else:
-    modo = "color"
-st.caption(f"🔍 Detección automática: **{modo.upper()}** (Saturación media={mean_sat:.1f})")
-
-# === Procesamiento según modo ===
-kernel = np.ones((3,3), np.uint8)
-
+# === Extracción de serie desde máscara ===
 def mask_to_series(mask):
     H, W = mask.shape
     ys = np.full(W, np.nan)
@@ -84,10 +83,11 @@ def mask_to_series(mask):
     ys = 1 - (ys - ys.min()) / (ys.max() - ys.min() + 1e-9)
     return ys
 
+
 series = {}
+kernel = np.ones((3, 3), np.uint8)
 
 if modo == "color":
-    # Detectar tres curvas por HSV
     mask_blue = cv2.inRange(hsv, (90, 60, 60), (130, 255, 255))
     mask_orange = cv2.inRange(hsv, (5, 100, 60), (25, 255, 255))
     mask_gray = cv2.inRange(hsv, (0, 0, 50), (180, 50, 200))
@@ -97,41 +97,50 @@ if modo == "color":
     series = {
         "staggered": mask_to_series(mask_blue),
         "early": mask_to_series(mask_orange),
-        "medium": mask_to_series(mask_gray)
+        "medium": mask_to_series(mask_gray),
     }
 else:
-    # === modo monocromático ===
     gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
     mask = cv2.inRange(gray, 0, 180)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
     series = {"principal": mask_to_series(mask)}
 
-# === Clasificación ===
+
+# === Clasificación con interpolación segura ===
 def clasificar(y, fechas, ref):
-    if y is None:
+    if y is None or len(y) < 5:
         return None
+
+    # Ajustar longitud de la serie al eje temporal
+    x_original = np.linspace(0, 1, len(y))
+    x_target = np.linspace(0, 1, len(fechas))
+    y_interp = np.interp(x_target, x_original, y)
+    y = y_interp.copy()
+
+    # Corte hasta fecha de referencia
     mask = fechas <= ref
     y = np.array(y)[mask]
     fechas = np.array(fechas)[mask]
     if len(y) < 5:
         return None
 
-    # suavizado
+    # Suavizado
     y_smooth = np.convolve(y, np.ones(5)/5, mode="same")
 
-    # picos
+    # Picos
     if find_peaks is not None:
         peaks, props = find_peaks(y_smooth, prominence=0.02)
         prom = np.mean(props.get("prominences", [0]))
     else:
         peaks = find_local_peaks(y_smooth, 0.02)
         prom = 0.02
+
     n_picos = len(peaks)
     max_y = float(y_smooth.max())
     fecha_pico = fechas[peaks[np.argmax(y_smooth[peaks])]] if n_picos else fechas[np.argmax(y_smooth)]
 
-    # tipo
-    if n_picos > 1 and np.std(y_smooth)/max(np.mean(y_smooth), 1e-6) > 0.4:
+    # Clasificación
+    if n_picos > 1 and np.std(y_smooth) / max(np.mean(y_smooth), 1e-6) > 0.4:
         tipo = "staggered"
     elif fecha_pico < dt.datetime(ref.year, 4, 1):
         tipo = "early"
@@ -140,9 +149,9 @@ def clasificar(y, fechas, ref):
     else:
         tipo = "late"
 
-    # confianza
-    cv = np.std(y_smooth)/max(np.mean(y_smooth), 1e-9)
-    confianza = 65 + prom*120 + cv*10
+    # Confianza
+    cv = np.std(y_smooth) / max(np.mean(y_smooth), 1e-9)
+    confianza = 65 + prom * 120 + cv * 10
     confianza = float(np.clip(confianza, 0, 99.9))
 
     return {
@@ -152,12 +161,14 @@ def clasificar(y, fechas, ref):
         "tipo": tipo,
         "confianza": round(confianza, 1),
         "y_full": y_smooth,
-        "fechas": fechas
+        "fechas": fechas,
     }
 
-resultados = {k: clasificar(v, dates, fecha_corte) for k,v in series.items()}
 
-# === Mostrar resultados ===
+# === Aplicar clasificación ===
+resultados = {k: clasificar(v, dates, fecha_corte) for k, v in series.items()}
+
+# === Tabla de resultados ===
 rows = []
 for k, r in resultados.items():
     if r is None:
@@ -169,21 +180,39 @@ for k, r in resultados.items():
             "max_y": r["max_y"],
             "fecha_pico": r["fecha_pico"],
             "tipo": r["tipo"],
-            "confianza_%": r["confianza"]
+            "confianza_%": r["confianza"],
         })
+
 df = pd.DataFrame(rows)
 st.subheader("📊 Resultado de clasificación")
-st.dataframe(df)
+st.dataframe(df, use_container_width=True)
+
+# === Exportar a Excel ===
+output = BytesIO()
+with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+    df.to_excel(writer, index=False, sheet_name="Clasificación")
+    writer.save()
+excel_data = output.getvalue()
+
+st.download_button(
+    label="💾 Descargar diagnóstico en Excel",
+    data=excel_data,
+    file_name="clasificacion_avefa.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
 
 # === Gráfico reconstruido ===
-st.subheader("📈 Reconstrucción")
-fig, ax = plt.subplots(figsize=(8,4))
+st.subheader("📈 Reconstrucción de curvas")
+fig, ax = plt.subplots(figsize=(8, 4))
+colors = {"staggered": "tab:blue", "early": "tab:orange", "medium": "tab:gray", "principal": "black"}
 for k, r in resultados.items():
-    if r is None: continue
-    ax.plot(r["fechas"], r["y_full"], label=f"{k} · {r['tipo']} ({r['confianza']}%)")
+    if r is None:
+        continue
+    ax.plot(r["fechas"], r["y_full"], label=f"{k} · {r['tipo']} ({r['confianza']}%)", color=colors.get(k, "black"))
 ax.axvline(fecha_corte, color="k", linestyle="--")
-ax.legend(); ax.set_ylabel("Intensidad relativa (normalizada)")
-ax.set_title("Clasificación automática")
+ax.legend()
+ax.set_ylabel("Intensidad relativa (normalizada)")
+ax.set_title("Clasificación automática de patrones")
 st.pyplot(fig)
 
 st.success("✅ Imagen procesada correctamente.")
