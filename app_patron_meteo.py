@@ -123,6 +123,43 @@ fig_line.update_layout(
 )
 st.plotly_chart(fig_line, use_container_width=True)
 
+# ---------- DETECCIÓN DEL DÍA MÁS CERTERO ----------
+def detectar_dia_mas_certero(df):
+    resultados = []
+    for i in range(30, len(df), 5):  # evalúa cada 5 días para suavizar
+        sub = df.iloc[:i]
+        c, _, p, _ = classify_pattern(sub)
+        resultados.append((sub["julian_days"].iloc[-1], c, p))
+    if not resultados:
+        return None, None, None
+    df_r = pd.DataFrame(resultados, columns=["JD", "clasif", "prob"])
+    df_r["prob_dominante"] = df_r["prob"].apply(lambda d: max(d.values()))
+    df_r["patron_dominante"] = df_r["prob"].apply(lambda d: max(d, key=d.get))
+    # día más certero = cuando la probabilidad supera 0.9
+    m = df_r[df_r["prob_dominante"] >= 0.9]
+    if not m.empty:
+        jd_certero = int(m.iloc[0]["JD"])
+        patron = m.iloc[0]["patron_dominante"].upper()
+        prob = m.iloc[0]["prob_dominante"]
+        return jd_certero, patron, prob
+    # fallback: día del máximo score
+    idxmax = df_r["prob_dominante"].idxmax()
+    return int(df_r.loc[idxmax, "JD"]), df_r.loc[idxmax, "patron_dominante"].upper(), df_r.loc[idxmax, "prob_dominante"]
+
+jd_certero, patron_certero, prob_certero = detectar_dia_mas_certero(df)
+if jd_certero:
+    st.info(f"📅 Día más certero para pronóstico: JD {jd_certero} → Patrón **{patron_certero}** con {prob_certero*100:.1f}% de confianza")
+else:
+    st.warning("No se detectó un día con alta certidumbre (≥ 0.9).")
+
+# ---------- MARCAR EN EL GRÁFICO ----------
+if jd_certero:
+    fig_line.add_vline(
+        x=jd_certero, line_width=4, line_dash="dot", line_color="orange",
+        annotation_text=f"Día más certero (JD {jd_certero})", annotation_position="bottom"
+    )
+
+
 # ---------- INTERPRETACIÓN AGRONÓMICA ----------
 st.markdown("---")
 st.subheader("🧠 Interpretación agronómica")
