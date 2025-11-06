@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 import datetime as dt
 from io import BytesIO
 
+
 # ---- Dependencias opcionales ----
 try:
     import cv2
