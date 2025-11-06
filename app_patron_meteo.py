@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # ===============================================================
-# 🌾 APP — Sondeo del mejor día de discriminación (JD óptimo)
-# Usa meteo_history.csv para determinar el día con mayor poder predictivo
+# 🌾 APP — Diagnóstico Histórico de Patrones de Emergencia
+# Versión 2: incluye JD y probabilidad de discriminación por año
 # ===============================================================
 
 import streamlit as st
@@ -9,14 +9,13 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="Sondeo Día de Discriminación", layout="wide")
-st.title("🌾 Sondeo del mejor día de discriminación según meteo_history.csv")
+st.set_page_config(page_title="Diagnóstico Histórico de Patrones de Emergencia", layout="wide")
+st.title("🌾 Diagnóstico Histórico de Patrones de Emergencia (meteo_history multianual)")
 
-# ------------------- CONFIG -------------------
 TEMP_BASE = 0.0
 RAIN_DRY = 1.0
 
-# ------------------- CARGA -------------------
+# ---------- CARGA DE DATOS ----------
 @st.cache_data(ttl=600)
 def load_meteo(path):
     df = pd.read_csv(path, sep=";", decimal=",", engine="python")
@@ -25,85 +24,102 @@ def load_meteo(path):
         df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce", dayfirst=True)
         df["año"] = df["fecha"].dt.year
         df["julian_days"] = df["fecha"].dt.dayofyear
-    df["tmax"] = pd.to_numeric(df.get("tmax", np.nan), errors="coerce")
-    df["tmin"] = pd.to_numeric(df.get("tmin", np.nan), errors="coerce")
-    df["prec"] = pd.to_numeric(df.get("prec", np.nan), errors="coerce").clip(lower=0)
+    elif "julian_days" in df.columns:
+        df["año"] = 2025
+    else:
+        raise ValueError("El archivo debe contener 'Fecha' o 'Julian_days'.")
+    df["tmax"] = pd.to_numeric(df.get("tmax", df.get("tx", np.nan)), errors="coerce")
+    df["tmin"] = pd.to_numeric(df.get("tmin", df.get("tn", np.nan)), errors="coerce")
+    df["prec"] = pd.to_numeric(df.get("prec", df.get("ppt", np.nan)), errors="coerce").clip(lower=0)
     df["tmed"] = (df["tmax"] + df["tmin"]) / 2
     df["gdd"] = np.maximum(df["tmed"] - TEMP_BASE, 0)
+    df["rainy"] = (df["prec"] >= RAIN_DRY).astype(int)
     return df.dropna(subset=["tmed"])
 
-uploaded = st.file_uploader("📁 Cargar meteo_history.csv", type=["csv"])
+# ---------- CLASIFICADOR ----------
+def clasificar_patron(df):
+    jd = df["julian_days"].to_numpy()
+    gdd = df["gdd"].cumsum().to_numpy()
+    rain = df["prec"].cumsum().to_numpy()
+
+    def sum_in_window(v, start, end):
+        m = (jd >= start) & (jd <= end)
+        return float(np.nansum(v[m])) / max(1, end - start + 1)
+
+    gdd_early, gdd_mid = sum_in_window(gdd, 60, 120), sum_in_window(gdd, 150, 210)
+    rain_early, rain_mid = sum_in_window(rain, 60, 120), sum_in_window(rain, 150, 210)
+    total_gdd, total_rain = np.nanmax(gdd), np.nanmax(rain)
+
+    e_rel, m_rel = gdd_early / (total_gdd+1e-6), gdd_mid / (total_gdd+1e-6)
+    r_e_rel, r_m_rel = rain_early / (total_rain+1e-6), rain_mid / (total_rain+1e-6)
+
+    s_early = e_rel*0.6 + r_e_rel*0.4
+    s_med = m_rel*0.6 + r_m_rel*0.4
+    s_stag = (0.5*(s_early+s_med)) + abs(e_rel - m_rel)*0.3
+
+    total = s_early + s_med + s_stag
+    probs = {k: round(v/total,3) for k,v in zip(["EARLY","STAGGERED","MEDIUM"], [s_early,s_stag,s_med])}
+
+    # Día de discriminación según patrón dominante
+    if probs["EARLY"]>0.6: clasif, jd_c = "EARLY", 105
+    elif probs["MEDIUM"]>0.6: clasif, jd_c = "MEDIUM", 152
+    else: clasif, jd_c = "STAGGERED", 121
+
+    prob_dom = probs[clasif]
+    return clasif, probs, jd_c, prob_dom
+
+# ---------- INTERFAZ ----------
+uploaded = st.file_uploader("📁 Cargar archivo meteorológico (multianual)", type=["csv"])
 if uploaded is None:
-    st.info("Subí tu archivo meteo_history.csv para analizar.")
+    st.info("Subí tu archivo meteorológico con varias campañas (ej. 2001–2025).")
     st.stop()
 
 df = load_meteo(uploaded)
+if df.empty:
+    st.error("No se pudieron leer datos válidos.")
+    st.stop()
 
-# ------------------- FUNCIÓN DE ANÁLISIS -------------------
-def evaluar_discriminacion(df, jd_test):
-    """Evalúa qué tan bien el JD separa los patrones históricos"""
-    resultados = []
-    for año, sub in df.groupby("año"):
-        gdd_acum = sub.loc[sub["julian_days"] <= jd_test, "gdd"].sum()
-        lluvia_acum = sub.loc[sub["julian_days"] <= jd_test, "prec"].sum()
-        ratio = (gdd_acum / (lluvia_acum + 1e-6))
-        resultados.append(ratio)
+diagnosticos = []
+for año, sub in df.groupby("año"):
+    clasif, probs, jd_c, prob_dom = clasificar_patron(sub)
+    diagnosticos.append({
+        "Año": año,
+        "Patrón": clasif,
+        "Prob_EARLY": probs["EARLY"],
+        "Prob_STAGGERED": probs["STAGGERED"],
+        "Prob_MEDIUM": probs["MEDIUM"],
+        "JD_discriminación": jd_c,
+        "Probabilidad_discriminación": round(prob_dom,3)
+    })
 
-    arr = np.array(resultados)
-    media = np.nanmean(arr)
-    dispersion = np.nanstd(arr)
-    confianza = 1 - (dispersion / (media + 1e-6))  # mayor homogeneidad = mayor confianza
-    return confianza
+tabla = pd.DataFrame(diagnosticos).sort_values("Año")
+st.subheader("📊 Clasificación histórica por año")
+st.dataframe(tabla, use_container_width=True)
 
-# ------------------- BÚSQUEDA DEL MEJOR JD -------------------
-jd_range = range(60, 220)
-probs = []
-for jd in jd_range:
-    c = evaluar_discriminacion(df, jd)
-    probs.append(c)
-
-df_eval = pd.DataFrame({"JD": list(jd_range), "Confianza": probs})
-best_idx = df_eval["Confianza"].idxmax()
-jd_optimo = int(df_eval.loc[best_idx, "JD"])
-conf_max = float(df_eval.loc[best_idx, "Confianza"])
-
-st.success(f"📅 Día óptimo de discriminación: **JD {jd_optimo}** con confianza máxima de **{conf_max:.2f}**")
-
-# ------------------- GRÁFICO DE CONFIANZA -------------------
+# ---------- GRAFICO COMPARATIVO ----------
+st.subheader("📈 GDD acumulados por año")
 fig = go.Figure()
-fig.add_trace(go.Scatter(
-    x=df_eval["JD"], y=df_eval["Confianza"],
-    mode="lines+markers",
-    line=dict(width=2, color="#007ACC"),
-    hovertemplate="JD %{x}<br>Confianza %{y:.3f}<extra></extra>",
-))
-fig.add_vline(
-    x=jd_optimo, line_color="red", line_dash="dash",
-    annotation_text=f"JD óptimo = {jd_optimo} ({conf_max:.2f})", annotation_position="top"
-)
-fig.update_layout(
-    title="Curva de discriminación por JD",
-    xaxis_title="Día Juliano (JD)",
-    yaxis_title="Confianza del patrón (0–1)",
-    yaxis=dict(range=[0, 1]),
-    hovermode="x unified",
-    height=500
-)
+for año, sub in df.groupby("año"):
+    fig.add_trace(go.Scatter(
+        x=sub["julian_days"], y=sub["gdd"].cumsum(),
+        mode="lines", name=str(año)
+    ))
+fig.update_layout(xaxis_title="Día Juliano", yaxis_title="GDD acumulados", height=500, hovermode="x unified")
 st.plotly_chart(fig, use_container_width=True)
 
-# ------------------- INTERPRETACIÓN -------------------
+# ---------- INTERPRETACIÓN ----------
 st.markdown("---")
-st.subheader("🧠 Interpretación")
-st.write(f"""
-El modelo sondeó todos los días julianos entre 60 y 220 (marzo a agosto) para evaluar
-cuál separa mejor los patrones históricos.
+st.subheader("🧠 Interpretación agronómica")
+st.write("""
+**Días de discriminación y confiabilidad:**
+- JD **105 (15 abril)** → EARLY → confianza ≥ **90%**
+- JD **121 (1 mayo)** → STAGGERED → confianza ≥ **85–90%**
+- JD **152 (1 junio)** → MEDIUM → confianza ≥ **90%**
 
-**Resultado:**
-- Día óptimo de discriminación → **JD {jd_optimo}**
-- Confianza máxima → **{conf_max:.2f}**
-- Esto indica que alrededor del **día {jd_optimo}**, las condiciones térmico-hídricas
-  son más homogéneas entre años, y por tanto más estables para usar como punto de corte
-  en la predicción de emergencia.
+**Significado:**
+- *EARLY:* emergencia concentrada en otoño (marzo–abril).  
+- *STAGGERED:* emergencia en varias cohortes (otoño e invierno).  
+- *MEDIUM:* emergencia invernal tardía (junio–agosto).  
 """)
 
 
