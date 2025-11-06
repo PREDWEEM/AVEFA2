@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # ===============================================================
 # 🌾 APP — Predicción del Patrón Histórico de Emergencia (AVEFA / PREDWEEM)
-# Versión 4: Diagnóstico fijo 1 de junio + evolución diaria de probabilidades
+# Versión 2: con gauge de probabilidad y barra temporal de discriminación
 # ===============================================================
 
 import streamlit as st
@@ -17,8 +17,8 @@ st.title("🌾 Predicción del Patrón Histórico de Emergencia (meteo_history.c
 # ---------- PARÁMETROS ----------
 TEMP_BASE = 0.0
 RAIN_DRY = 1.0
+MONTH_START = 9
 YEAR_REF = 2025
-JD_DIAG = 152  # 1 de junio
 
 # ---------- CARGA DE DATOS ----------
 @st.cache_data(ttl=600)
@@ -45,109 +45,90 @@ def compute_indicators(df):
     df["ih_thermal"] = df["gdd_cum"] * (1 + df["rain_cum"] / 100)
     return df
 
-# ---------- CLASIFICADOR (vectorizable para todos los días) ----------
-def compute_probs(df):
+def classify_pattern(df):
     jd = df["julian_days"].to_numpy()
     gdd = df["gdd_cum"].to_numpy()
     rain = df["rain_cum"].to_numpy()
+    def sum_in_window(v, start, end):
+        m = (jd >= start) & (jd <= end)
+        return float(np.nansum(v[m])) / max(1, end - start + 1)
+    gdd_early, gdd_mid = sum_in_window(gdd, 60, 120), sum_in_window(gdd, 150, 210)
+    rain_early, rain_mid = sum_in_window(rain, 60, 120), sum_in_window(rain, 150, 210)
     total_gdd, total_rain = np.nanmax(gdd), np.nanmax(rain)
-    probs = {"early": [], "staggered": [], "medium": []}
+    e_rel, m_rel = gdd_early / (total_gdd+1e-6), gdd_mid / (total_gdd+1e-6)
+    r_e_rel, r_m_rel = rain_early / (total_rain+1e-6), rain_mid / (total_rain+1e-6)
+    score_early = (e_rel * 0.6 + r_e_rel * 0.4)
+    score_medium = (m_rel * 0.6 + r_m_rel * 0.4)
+    score_staggered = (0.5 * (score_early + score_medium)) + abs(e_rel - m_rel) * 0.3
+    scores = {"early": score_early, "staggered": score_staggered, "medium": score_medium}
+    total = sum(scores.values())
+    probs = {k: round(v / total, 3) for k, v in scores.items()}
+    if probs["early"] > 0.6:
+        fecha, clasif, jd_disc = "15 de abril (≈ JD 105)", "EARLY", 105
+    elif probs["medium"] > 0.6:
+        fecha, clasif, jd_disc = "1 de junio (≈ JD 152)", "MEDIUM", 152
+    else:
+        fecha, clasif, jd_disc = "1 de mayo (≈ JD 121)", "STAGGERED", 121
+    return clasif, fecha, probs, jd_disc
 
-    for i in range(len(jd)):
-        sub = jd <= jd[i]
-        gdd_sub, rain_sub = gdd[sub], rain[sub]
-
-        def sum_in_window(v, start, end):
-            m = (jd[sub] >= start) & (jd[sub] <= end)
-            return float(np.nansum(v[m])) / max(1, end - start + 1)
-
-        gdd_early, gdd_mid = sum_in_window(gdd_sub, 60, 120), sum_in_window(gdd_sub, 150, 210)
-        rain_early, rain_mid = sum_in_window(rain_sub, 60, 120), sum_in_window(rain_sub, 150, 210)
-
-        e_rel = gdd_early / (total_gdd + 1e-6)
-        m_rel = gdd_mid / (total_gdd + 1e-6)
-        r_e_rel = rain_early / (total_rain + 1e-6)
-        r_m_rel = rain_mid / (total_rain + 1e-6)
-
-        score_early = (e_rel * 0.6 + r_e_rel * 0.4)
-        score_medium = (m_rel * 0.6 + r_m_rel * 0.4)
-        score_staggered = (0.5 * (score_early + score_medium)) + abs(e_rel - m_rel) * 0.3
-        total = score_early + score_staggered + score_medium
-        probs["early"].append(score_early / total)
-        probs["staggered"].append(score_staggered / total)
-        probs["medium"].append(score_medium / total)
-
-    for k in probs: probs[k] = np.array(probs[k])
-    return probs
-
-# ---------- EJECUCIÓN ----------
 uploaded = st.file_uploader("📁 Cargar meteo_history.csv", type=["csv"])
 df = load_meteo_history(uploaded) if uploaded else load_meteo_history("meteo_history.csv")
 if df.empty: st.error("No se pudieron cargar los datos."); st.stop()
 df = compute_indicators(df)
-probs = compute_probs(df)
 
-# ---------- DIAGNÓSTICO FINAL (JD 152) ----------
-df_diag = df[df["julian_days"] <= JD_DIAG]
-final_idx = (np.abs(df["julian_days"] - JD_DIAG)).argmin()
-final_probs = {k: round(float(probs[k][final_idx]), 3) for k in probs}
-clasif = max(final_probs, key=final_probs.get).upper()
+# ---------- CLASIFICACIÓN ----------
+clasif, fecha, probs, jd_disc = classify_pattern(df)
 
-# ---------- VISUALIZACIÓN PRINCIPAL ----------
+# ---------- VISUALIZACIÓN ----------
 col1, col2 = st.columns([1.2, 1])
 with col1:
-    st.metric("🧩 Patrón clasificado (diagnóstico 1 de junio)", clasif)
-    st.json(final_probs)
+    st.metric("🧩 Patrón clasificado", clasif)
+    st.write(f"📆 Fecha de predicción fiable: **{fecha}**")
+    st.write("🔢 Probabilidades estimadas:")
+    st.json(probs)
 with col2:
-    val = final_probs[clasif.lower()] * 100
+    val = probs[clasif.lower()] * 100
     fig_gauge = go.Figure(go.Indicator(
         mode="gauge+number",
         value=val,
+        domain={'x': [0, 1], 'y': [0, 1]},
         title={'text': f"Probabilidad {clasif}", 'font': {'size': 22}},
         gauge={
             'axis': {'range': [0, 100]},
             'bar': {'color': "#00A651" if clasif=="EARLY" else "#E5C700" if clasif=="STAGGERED" else "#1976D2"},
-            'steps': [{'range': [0, 50], 'color': '#EEEEEE'}, {'range': [50, 100], 'color': '#B3E5FC'}]
+            'steps': [
+                {'range': [0, 50], 'color': '#E5E5E5'},
+                {'range': [50, 100], 'color': '#B3E5FC'}
+            ]
         }
     ))
     st.plotly_chart(fig_gauge, use_container_width=True)
 
-# ---------- EVOLUCIÓN TEMPORAL DE PROBABILIDADES ----------
-st.subheader("📈 Evolución diaria de probabilidad de patrón (hasta 1 de junio)")
-fig_prob = go.Figure()
-for k, col, name in [
-    ("early", "#00A651", "EARLY"),
-    ("staggered", "#E5C700", "STAGGERED"),
-    ("medium", "#1976D2", "MEDIUM"),
-]:
-    fig_prob.add_trace(go.Scatter(
-        x=df["julian_days"], y=probs[k]*100, mode="lines",
-        name=f"{name}", line=dict(width=3, color=col)
-    ))
-fig_prob.add_vline(x=JD_DIAG, line_width=3, line_dash="dash", line_color="green",
-                   annotation_text="1 de junio (diagnóstico definitivo)", annotation_position="top")
-fig_prob.update_layout(
-    yaxis_title="Probabilidad (%)", xaxis_title="Día Juliano (JD)",
-    hovermode="x unified", height=500, legend_title="Patrón"
-)
-st.plotly_chart(fig_prob, use_container_width=True)
-
-# ---------- CURVAS ACUMULADAS DE CLIMA ----------
-st.subheader("🌡️ Acumulados térmicos e hídricos")
+# ---------- BARRA TEMPORAL ----------
+st.subheader("📆 Línea temporal y discriminación del patrón")
 fig_line = go.Figure()
-fig_line.add_trace(go.Scatter(x=df["julian_days"], y=df["gdd_cum"], mode="lines", name="GDD acumulados", line=dict(color="red", width=2)))
-fig_line.add_trace(go.Scatter(x=df["julian_days"], y=df["rain_cum"], mode="lines", name="Lluvia acumulada (mm)", line=dict(color="blue", width=2)))
-fig_line.add_vline(x=JD_DIAG, line_width=3, line_dash="dash", line_color="green", annotation_text="1 de junio", annotation_position="top")
-fig_line.update_layout(xaxis_title="Día Juliano (JD)", yaxis_title="Valor acumulado", hovermode="x unified", height=500)
+fig_line.add_trace(go.Scatter(
+    x=df["julian_days"], y=df["gdd_cum"], mode="lines", name="GDD acumulados", line=dict(color="red", width=2)
+))
+fig_line.add_trace(go.Scatter(
+    x=df["julian_days"], y=df["rain_cum"], mode="lines", name="Lluvia acumulada (mm)", line=dict(color="blue", width=2)
+))
+fig_line.add_vline(
+    x=jd_disc, line_width=3, line_dash="dash", line_color="green",
+    annotation_text=f"Diagnóstico ({fecha})", annotation_position="top"
+)
+fig_line.update_layout(
+    xaxis_title="Día Juliano (JD)", yaxis_title="Valor acumulado",
+    hovermode="x unified", height=500, legend_title="Variables"
+)
 st.plotly_chart(fig_line, use_container_width=True)
 
 # ---------- INTERPRETACIÓN AGRONÓMICA ----------
 st.markdown("---")
-st.subheader("🧠 Interpretación agronómica (Diagnóstico 1 de junio)")
+st.subheader("🧠 Interpretación agronómica")
 if clasif == "EARLY":
     st.success("🌱 **Patrón EARLY** — Emergencia concentrada en marzo–abril. Control presiembra y preemergente crucial.")
 elif clasif == "STAGGERED":
     st.warning("🌾 **Patrón STAGGERED** — Emergencia escalonada (2+ cohortes). Residual prolongado + monitoreo hasta julio.")
 else:
     st.info("❄️ **Patrón MEDIUM** — Emergencia invernal tardía. Requiere control residual largo o postemergente invernal.")
-
