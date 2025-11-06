@@ -486,3 +486,34 @@ st.download_button(
     data=buf.getvalue(), file_name=f"AVEFA_resultados_{'todo' if rango_opcion=='Todo el empalme' else 'rango'}.csv",
     mime="text/csv"
 )
+
+import predice_patron_meteo as ppm
+
+if st.sidebar.button("🔎 Predecir patrón histórico (meteo_history)"):
+    res = ppm.predecir_patron("meteo_history.csv")
+    st.success(f"Patrón histórico predicho: {res['clasificacion']}")
+    st.info(f"Fecha de predicción fiable: {res['fecha_prediccion_fiable']}")
+    st.json(res['probabilidades'])
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
