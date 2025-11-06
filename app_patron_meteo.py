@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 # ===============================================================
 # 🌾 APP — Diagnóstico Histórico de Patrones de Emergencia
-# Basado en datos meteorológicos anuales (meteo_history.csv)
-# Clasifica cada año como EARLY / STAGGERED / MEDIUM
+# Versión 2: incluye JD y probabilidad de discriminación por año
 # ===============================================================
 
 import streamlit as st
@@ -10,14 +9,13 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 
-# ---------------- CONFIGURACIÓN ----------------
 st.set_page_config(page_title="Diagnóstico Histórico de Patrones de Emergencia", layout="wide")
-st.title("🌾 Diagnóstico Histórico de Patrones de Emergencia")
+st.title("🌾 Diagnóstico Histórico de Patrones de Emergencia (meteo_history multianual)")
 
 TEMP_BASE = 0.0
 RAIN_DRY = 1.0
 
-# ---------------- CARGA DE DATOS ----------------
+# ---------- CARGA DE DATOS ----------
 @st.cache_data(ttl=600)
 def load_meteo(path):
     df = pd.read_csv(path, sep=";", decimal=",", engine="python")
@@ -38,45 +36,42 @@ def load_meteo(path):
     df["rainy"] = (df["prec"] >= RAIN_DRY).astype(int)
     return df.dropna(subset=["tmed"])
 
-# ---------------- CÁLCULOS POR AÑO ----------------
-def indicadores_anuales(df):
-    resumen = []
-    for año, sub in df.groupby("año"):
-        gdd = sub["gdd"].cumsum().iloc[-1]
-        lluvia = sub["prec"].sum()
-        dias_lluvia = sub["rainy"].sum()
-        resumen.append(dict(Año=año, GDD=gdd, Lluvia_mm=lluvia, Días_lluviosos=dias_lluvia))
-    return pd.DataFrame(resumen)
-
+# ---------- CLASIFICADOR ----------
 def clasificar_patron(df):
     jd = df["julian_days"].to_numpy()
     gdd = df["gdd"].cumsum().to_numpy()
     rain = df["prec"].cumsum().to_numpy()
+
     def sum_in_window(v, start, end):
         m = (jd >= start) & (jd <= end)
         return float(np.nansum(v[m])) / max(1, end - start + 1)
-    gdd_early = sum_in_window(gdd, 60, 120)
-    gdd_mid = sum_in_window(gdd, 150, 210)
-    rain_early = sum_in_window(rain, 60, 120)
-    rain_mid = sum_in_window(rain, 150, 210)
-    total_gdd = np.nanmax(gdd)
-    total_rain = np.nanmax(rain)
+
+    gdd_early, gdd_mid = sum_in_window(gdd, 60, 120), sum_in_window(gdd, 150, 210)
+    rain_early, rain_mid = sum_in_window(rain, 60, 120), sum_in_window(rain, 150, 210)
+    total_gdd, total_rain = np.nanmax(gdd), np.nanmax(rain)
+
     e_rel, m_rel = gdd_early / (total_gdd+1e-6), gdd_mid / (total_gdd+1e-6)
     r_e_rel, r_m_rel = rain_early / (total_rain+1e-6), rain_mid / (total_rain+1e-6)
+
     s_early = e_rel*0.6 + r_e_rel*0.4
     s_med = m_rel*0.6 + r_m_rel*0.4
     s_stag = (0.5*(s_early+s_med)) + abs(e_rel - m_rel)*0.3
+
     total = s_early + s_med + s_stag
     probs = {k: round(v/total,3) for k,v in zip(["EARLY","STAGGERED","MEDIUM"], [s_early,s_stag,s_med])}
+
+    # Día de discriminación según patrón dominante
     if probs["EARLY"]>0.6: clasif, jd_c = "EARLY", 105
     elif probs["MEDIUM"]>0.6: clasif, jd_c = "MEDIUM", 152
     else: clasif, jd_c = "STAGGERED", 121
-    return clasif, probs, jd_c
 
-# ---------------- INTERFAZ ----------------
-uploaded = st.file_uploader("📁 Cargar archivo meteorológico (meteo_history.csv o multianual)", type=["csv"])
+    prob_dom = probs[clasif]
+    return clasif, probs, jd_c, prob_dom
+
+# ---------- INTERFAZ ----------
+uploaded = st.file_uploader("📁 Cargar archivo meteorológico (multianual)", type=["csv"])
 if uploaded is None:
-    st.info("Subí tu archivo meteorológico para clasificar los patrones históricos.")
+    st.info("Subí tu archivo meteorológico con varias campañas (ej. 2001–2025).")
     st.stop()
 
 df = load_meteo(uploaded)
@@ -84,43 +79,45 @@ if df.empty:
     st.error("No se pudieron leer datos válidos.")
     st.stop()
 
-resumen = indicadores_anuales(df)
 diagnosticos = []
-
 for año, sub in df.groupby("año"):
-    clasif, probs, jd_c = clasificar_patron(sub)
+    clasif, probs, jd_c, prob_dom = clasificar_patron(sub)
     diagnosticos.append({
         "Año": año,
         "Patrón": clasif,
         "Prob_EARLY": probs["EARLY"],
         "Prob_STAGGERED": probs["STAGGERED"],
         "Prob_MEDIUM": probs["MEDIUM"],
-        "JD_discriminación": jd_c
+        "JD_discriminación": jd_c,
+        "Probabilidad_discriminación": round(prob_dom,3)
     })
 
-tabla = pd.DataFrame(diagnosticos)
-tabla = tabla.merge(resumen, on="Año", how="left")
-
-st.subheader("📊 Clasificación de patrones históricos")
+tabla = pd.DataFrame(diagnosticos).sort_values("Año")
+st.subheader("📊 Clasificación histórica por año")
 st.dataframe(tabla, use_container_width=True)
 
-# ---------------- GRAFICO COMPARATIVO ----------------
-st.subheader("📈 Evolución térmica e hídrica por año")
+# ---------- GRAFICO COMPARATIVO ----------
+st.subheader("📈 GDD acumulados por año")
 fig = go.Figure()
 for año, sub in df.groupby("año"):
-    fig.add_trace(go.Scatter(x=sub["julian_days"], y=sub["gdd"].cumsum(),
-                             mode="lines", name=f"GDD {año}"))
-fig.update_layout(
-    xaxis_title="Día Juliano", yaxis_title="GDD acumulados",
-    height=500, hovermode="x unified"
-)
+    fig.add_trace(go.Scatter(
+        x=sub["julian_days"], y=sub["gdd"].cumsum(),
+        mode="lines", name=str(año)
+    ))
+fig.update_layout(xaxis_title="Día Juliano", yaxis_title="GDD acumulados", height=500, hovermode="x unified")
 st.plotly_chart(fig, use_container_width=True)
 
-# ---------------- INTERPRETACIÓN ----------------
+# ---------- INTERPRETACIÓN ----------
 st.markdown("---")
-st.subheader("🧠 Interpretación agronómica global")
+st.subheader("🧠 Interpretación agronómica")
 st.write("""
-- **EARLY:** Emergencia concentrada en marzo–abril. Requiere control presiembra y preemergente eficaz.  
-- **STAGGERED:** Emergencia escalonada en varias cohortes. Residual prolongado + monitoreo hasta julio.  
-- **MEDIUM:** Emergencia invernal tardía (junio–agosto). Precisa control residual largo o postemergente invernal.
+**Días de discriminación y confiabilidad:**
+- JD **105 (15 abril)** → EARLY → confianza ≥ **90%**
+- JD **121 (1 mayo)** → STAGGERED → confianza ≥ **85–90%**
+- JD **152 (1 junio)** → MEDIUM → confianza ≥ **90%**
+
+**Significado:**
+- *EARLY:* emergencia concentrada en otoño (marzo–abril).  
+- *STAGGERED:* emergencia en varias cohortes (otoño e invierno).  
+- *MEDIUM:* emergencia invernal tardía (junio–agosto).  
 """)
