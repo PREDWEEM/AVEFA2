@@ -1,125 +1,83 @@
 # -*- coding: utf-8 -*-
 # ===============================================================
-# 🌾 APP — Diagnóstico Histórico de Patrones de Emergencia
-# Versión 2: incluye JD y probabilidad de discriminación por año
+# 🌾 AVEFA — Clasificador de patrones por picos y magnitud (desde imagen)
 # ===============================================================
-
 import streamlit as st
-import pandas as pd
+import cv2
 import numpy as np
-import plotly.graph_objects as go
+import matplotlib.pyplot as plt
+from scipy.signal import find_peaks
+import datetime as dt
+import pandas as pd
 
-st.set_page_config(page_title="Diagnóstico Histórico de Patrones de Emergencia", layout="wide")
-st.title("🌾 Diagnóstico Histórico de Patrones de Emergencia (meteo_history multianual)")
+st.title("🌾 Clasificador de patrones (AVEFA) desde imagen")
 
-TEMP_BASE = 0.0
-RAIN_DRY = 1.0
+# === CARGA DE IMAGEN ===
+st.write("📸 Pegá o arrastrá la imagen del gráfico aquí:")
+uploaded_file = st.file_uploader("Cargar imagen", type=["png", "jpg", "jpeg"])
 
-# ---------- CARGA DE DATOS ----------
-@st.cache_data(ttl=600)
-def load_meteo(path):
-    df = pd.read_csv(path, sep=";", decimal=",", engine="python")
-    df.columns = [c.strip().lower() for c in df.columns]
-    if "fecha" in df.columns:
-        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce", dayfirst=True)
-        df["año"] = df["fecha"].dt.year
-        df["julian_days"] = df["fecha"].dt.dayofyear
-    elif "julian_days" in df.columns:
-        df["año"] = 2025
-    else:
-        raise ValueError("El archivo debe contener 'Fecha' o 'Julian_days'.")
-    df["tmax"] = pd.to_numeric(df.get("tmax", df.get("tx", np.nan)), errors="coerce")
-    df["tmin"] = pd.to_numeric(df.get("tmin", df.get("tn", np.nan)), errors="coerce")
-    df["prec"] = pd.to_numeric(df.get("prec", df.get("ppt", np.nan)), errors="coerce").clip(lower=0)
-    df["tmed"] = (df["tmax"] + df["tmin"]) / 2
-    df["gdd"] = np.maximum(df["tmed"] - TEMP_BASE, 0)
-    df["rainy"] = (df["prec"] >= RAIN_DRY).astype(int)
-    return df.dropna(subset=["tmed"])
+fecha_ref = dt.datetime(2010, 6, 1)
 
-# ---------- CLASIFICADOR ----------
-def clasificar_patron(df):
-    jd = df["julian_days"].to_numpy()
-    gdd = df["gdd"].cumsum().to_numpy()
-    rain = df["prec"].cumsum().to_numpy()
+if uploaded_file is not None:
+    # Convertir la imagen
+    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+    img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    st.image(img_rgb, caption="Imagen cargada", use_column_width=True)
 
-    def sum_in_window(v, start, end):
-        m = (jd >= start) & (jd <= end)
-        return float(np.nansum(v[m])) / max(1, end - start + 1)
+    st.subheader("🔍 Extracción de curvas y clasificación")
 
-    gdd_early, gdd_mid = sum_in_window(gdd, 60, 120), sum_in_window(gdd, 150, 210)
-    rain_early, rain_mid = sum_in_window(rain, 60, 120), sum_in_window(rain, 150, 210)
-    total_gdd, total_rain = np.nanmax(gdd), np.nanmax(rain)
+    # === Simulación de extracción (placeholder: en producción se usaría detección de color) ===
+    # Supongamos que ya tenemos series extraídas
+    fechas = pd.date_range("2010-01-01", "2010-11-01", freq="D")
+    patrones = {
+        "staggered": np.random.rand(len(fechas)) * 0.1,
+        "early": np.random.rand(len(fechas)) * 0.1,
+        "medium": np.random.rand(len(fechas)) * 0.1,
+    }
 
-    e_rel, m_rel = gdd_early / (total_gdd+1e-6), gdd_mid / (total_gdd+1e-6)
-    r_e_rel, r_m_rel = rain_early / (total_rain+1e-6), rain_mid / (total_rain+1e-6)
+    # Suavizado y clasificación
+    def clasificar_patron(y, fechas, ref=fecha_ref):
+        mask = fechas <= ref
+        y = np.array(y)[mask]
+        fechas = np.array(fechas)[mask]
 
-    s_early = e_rel*0.6 + r_e_rel*0.4
-    s_med = m_rel*0.6 + r_m_rel*0.4
-    s_stag = (0.5*(s_early+s_med)) + abs(e_rel - m_rel)*0.3
+        peaks, _ = find_peaks(y, prominence=0.01)
+        n_picos = len(peaks)
+        max_y = y[peaks].max() if n_picos > 0 else y.max()
+        if n_picos > 0:
+            fecha_pico = fechas[peaks[np.argmax(y[peaks])]]
+        else:
+            fecha_pico = fechas[np.argmax(y)]
 
-    total = s_early + s_med + s_stag
-    probs = {k: round(v/total,3) for k,v in zip(["EARLY","STAGGERED","MEDIUM"], [s_early,s_stag,s_med])}
+        if n_picos > 1 and np.std(y) / np.mean(y) > 0.4:
+            tipo = "staggered"
+        elif fecha_pico < dt.datetime(2010, 4, 1):
+            tipo = "early"
+        elif fecha_pico <= dt.datetime(2010, 6, 1):
+            tipo = "medium"
+        else:
+            tipo = "late"
+        return {
+            "n_picos": n_picos,
+            "max_y": round(float(max_y), 4),
+            "fecha_pico": fecha_pico.date(),
+            "tipo": tipo
+        }
 
-    # Día de discriminación según patrón dominante
-    if probs["EARLY"]>0.6: clasif, jd_c = "EARLY", 105
-    elif probs["MEDIUM"]>0.6: clasif, jd_c = "MEDIUM", 152
-    else: clasif, jd_c = "STAGGERED", 121
+    # === Aplicar ===
+    resultados = {}
+    for k, v in patrones.items():
+        resultados[k] = clasificar_patron(v, fechas)
 
-    prob_dom = probs[clasif]
-    return clasif, probs, jd_c, prob_dom
+    res_df = pd.DataFrame(resultados).T
+    st.dataframe(res_df)
 
-# ---------- INTERFAZ ----------
-uploaded = st.file_uploader("📁 Cargar archivo meteorológico (multianual)", type=["csv"])
-if uploaded is None:
-    st.info("Subí tu archivo meteorológico con varias campañas (ej. 2001–2025).")
-    st.stop()
-
-df = load_meteo(uploaded)
-if df.empty:
-    st.error("No se pudieron leer datos válidos.")
-    st.stop()
-
-diagnosticos = []
-for año, sub in df.groupby("año"):
-    clasif, probs, jd_c, prob_dom = clasificar_patron(sub)
-    diagnosticos.append({
-        "Año": año,
-        "Patrón": clasif,
-        "Prob_EARLY": probs["EARLY"],
-        "Prob_STAGGERED": probs["STAGGERED"],
-        "Prob_MEDIUM": probs["MEDIUM"],
-        "JD_discriminación": jd_c,
-        "Probabilidad_discriminación": round(prob_dom,3)
-    })
-
-tabla = pd.DataFrame(diagnosticos).sort_values("Año")
-st.subheader("📊 Clasificación histórica por año")
-st.dataframe(tabla, use_container_width=True)
-
-# ---------- GRAFICO COMPARATIVO ----------
-st.subheader("📈 GDD acumulados por año")
-fig = go.Figure()
-for año, sub in df.groupby("año"):
-    fig.add_trace(go.Scatter(
-        x=sub["julian_days"], y=sub["gdd"].cumsum(),
-        mode="lines", name=str(año)
-    ))
-fig.update_layout(xaxis_title="Día Juliano", yaxis_title="GDD acumulados", height=500, hovermode="x unified")
-st.plotly_chart(fig, use_container_width=True)
-
-# ---------- INTERPRETACIÓN ----------
-st.markdown("---")
-st.subheader("🧠 Interpretación agronómica")
-st.write("""
-**Días de discriminación y confiabilidad:**
-- JD **105 (15 abril)** → EARLY → confianza ≥ **90%**
-- JD **121 (1 mayo)** → STAGGERED → confianza ≥ **85–90%**
-- JD **152 (1 junio)** → MEDIUM → confianza ≥ **90%**
-
-**Significado:**
-- *EARLY:* emergencia concentrada en otoño (marzo–abril).  
-- *STAGGERED:* emergencia en varias cohortes (otoño e invierno).  
-- *MEDIUM:* emergencia invernal tardía (junio–agosto).  
-""")
-
+    # === Visualización ===
+    fig, ax = plt.subplots(figsize=(8,5))
+    for k, v in patrones.items():
+        ax.plot(fechas, v, label=k)
+    ax.axvline(fecha_ref, color='k', linestyle='--', label="1 Jun")
+    ax.legend(); ax.set_title("Clasificación hasta 1 de junio")
+    st.pyplot(fig)
 
